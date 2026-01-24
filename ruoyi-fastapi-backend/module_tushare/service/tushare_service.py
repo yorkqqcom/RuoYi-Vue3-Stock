@@ -259,7 +259,15 @@ class TushareDownloadTaskService:
         if not await cls.check_task_unique_services(query_db, page_object):
             raise ServiceException(message=f'新增下载任务{page_object.task_name}失败，任务名称已存在')
         try:
-            add_task = await TushareDownloadTaskDao.add_task_dao(query_db, page_object)
+            # 处理cron_expression：空字符串转换为None，使用by_alias=False确保使用snake_case键名
+            task_dict = page_object.model_dump(exclude={'task_id'}, by_alias=False)
+            if 'cron_expression' in task_dict:
+                task_dict['cron_expression'] = (
+                    task_dict['cron_expression'].strip()
+                    if task_dict['cron_expression'] and task_dict['cron_expression'].strip()
+                    else None
+                )
+            add_task = await TushareDownloadTaskDao.add_task_dao(query_db, TushareDownloadTaskModel(**task_dict))
             await query_db.commit()
             result = {'is_success': True, 'message': '新增成功'}
         except Exception as e:
@@ -276,19 +284,35 @@ class TushareDownloadTaskService:
         :param page_object: 编辑下载任务对象
         :param edit_task: 编辑下载任务字典
         """
+        logger.info(f'[_deal_edit_task] 开始处理，type: {page_object.type}')
+        logger.info(f'[_deal_edit_task] page_object.cron_expression: {page_object.cron_expression}, 类型: {type(page_object.cron_expression)}')
+        
         if page_object.type == 'status':
             edit_task['status'] = page_object.status
+            logger.info(f'[_deal_edit_task] 只更新状态: {page_object.status}')
         else:
             edit_task['task_name'] = page_object.task_name
             edit_task['config_id'] = page_object.config_id
-            edit_task['cron_expression'] = page_object.cron_expression
+            # 处理cron_expression：空字符串转换为None
+            original_cron = page_object.cron_expression
+            if original_cron and isinstance(original_cron, str) and original_cron.strip():
+                edit_task['cron_expression'] = original_cron.strip()
+                logger.info(f'[_deal_edit_task] cron_expression处理: "{original_cron}" -> "{edit_task["cron_expression"]}"')
+            else:
+                edit_task['cron_expression'] = None
+                logger.info(f'[_deal_edit_task] cron_expression处理: "{original_cron}" -> None')
+            
             edit_task['start_date'] = page_object.start_date
             edit_task['end_date'] = page_object.end_date
             edit_task['task_params'] = page_object.task_params
             edit_task['save_path'] = page_object.save_path
             edit_task['save_format'] = page_object.save_format
+            edit_task['save_to_db'] = page_object.save_to_db
+            edit_task['data_table_name'] = page_object.data_table_name
             edit_task['status'] = page_object.status
             edit_task['remark'] = page_object.remark
+            
+            logger.info(f'[_deal_edit_task] 处理完成，cron_expression最终值: {edit_task.get("cron_expression")}')
 
     @classmethod
     async def edit_task_services(
@@ -301,23 +325,66 @@ class TushareDownloadTaskService:
         :param page_object: 编辑下载任务对象
         :return: 编辑下载任务校验结果
         """
+        logger.info(f'[编辑任务] 开始编辑任务，task_id: {page_object.task_id}, type: {page_object.type}')
+        logger.info(f'[编辑任务] 接收到的数据: {page_object.model_dump(by_alias=True)}')
+        
         old_task = await TushareDownloadTaskDao.get_task_detail_by_id(query_db, page_object.task_id)
         if not old_task:
+            logger.error(f'[编辑任务] 任务不存在，task_id: {page_object.task_id}')
             raise ServiceException(message='下载任务不存在')
+        
+        logger.info(f'[编辑任务] 原始任务数据: task_name={old_task.task_name}, cron_expression={old_task.cron_expression}')
+        
         if page_object.type != 'status':
             check_task = TushareDownloadTaskModel(
                 task_id=page_object.task_id,
                 task_name=page_object.task_name,
             )
             if not await cls.check_task_unique_services(query_db, check_task):
+                logger.error(f'[编辑任务] 任务名称已存在: {page_object.task_name}')
                 raise ServiceException(message=f'编辑下载任务{page_object.task_name}失败，任务名称已存在')
         try:
-            edit_task_dict = page_object.model_dump(exclude={'task_id', 'type'}, exclude_none=True)
+            # 先获取所有字段（包括None值），使用by_alias=False确保使用snake_case键名
+            # 排除不应该在编辑时更新的字段：统计字段和创建相关字段
+            edit_task_dict = page_object.model_dump(
+                exclude={
+                    'task_id', 'type',
+                    'last_run_time', 'next_run_time', 'run_count', 'success_count', 'fail_count',
+                    'create_by', 'create_time'
+                },
+                exclude_none=False,
+                by_alias=False
+            )
+            logger.info(f'[编辑任务] model_dump后的字典: {edit_task_dict}')
+            
             cls._deal_edit_task(page_object, edit_task_dict)
-            await TushareDownloadTaskDao.edit_task_dao(query_db, TushareDownloadTaskModel(**edit_task_dict))
+            logger.info(f'[编辑任务] _deal_edit_task处理后的字典: {edit_task_dict}')
+            
+            # 添加 update_by 和 update_time 到字典中
+            edit_task_dict['update_by'] = page_object.update_by
+            edit_task_dict['update_time'] = page_object.update_time
+            # 添加 task_id 用于更新条件
+            edit_task_dict['task_id'] = page_object.task_id
+            logger.info(f'[编辑任务] 最终更新字典: {edit_task_dict}')
+            logger.info(f'[编辑任务] 准备直接使用字典更新，task_id: {page_object.task_id}')
+            
+            # 直接使用字典更新，避免模型转换时的字段名问题
+            result_id = await TushareDownloadTaskDao.edit_task_dao(query_db, page_object.task_id, edit_task_dict)
+            logger.info(f'[编辑任务] DAO更新返回的task_id: {result_id}')
+            
             await query_db.commit()
+            logger.info(f'[编辑任务] 事务提交成功')
+            
+            # 验证更新结果
+            updated_task = await TushareDownloadTaskDao.get_task_detail_by_id(query_db, page_object.task_id)
+            if updated_task:
+                logger.info(f'[编辑任务] 更新后的任务数据: task_name={updated_task.task_name}, cron_expression={updated_task.cron_expression}')
+            else:
+                logger.warning(f'[编辑任务] 更新后无法获取任务数据，task_id: {page_object.task_id}')
+            
             result = {'is_success': True, 'message': '编辑成功'}
         except Exception as e:
+            logger.exception(f'[编辑任务] 编辑任务失败，task_id: {page_object.task_id}, 错误: {str(e)}')
             await query_db.rollback()
             raise e
 

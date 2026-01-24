@@ -231,20 +231,68 @@ class TushareDownloadTaskDao:
         return db_task
 
     @classmethod
-    async def edit_task_dao(cls, db: AsyncSession, task: TushareDownloadTaskModel) -> int:
+    async def edit_task_dao(
+        cls, db: AsyncSession, task_id_or_model: int | TushareDownloadTaskModel, task_dict: dict[str, Any] | None = None
+    ) -> int:
         """
         编辑任务信息
 
         :param db: orm对象
-        :param task: 任务对象
+        :param task_id_or_model: 任务ID（int）或任务模型对象（TushareDownloadTaskModel）
+        :param task_dict: 任务字段字典（snake_case格式），当第一个参数是task_id时使用
         :return: 编辑结果
         """
-        await db.execute(
-            update(TushareDownloadTask)
-            .where(TushareDownloadTask.task_id == task.task_id)
-            .values(**task.model_dump(exclude={'task_id'}, exclude_none=True))
-        )
-        return task.task_id
+        from utils.log_util import logger
+        
+        # 支持两种调用方式：1) edit_task_dao(db, task_id, task_dict) 2) edit_task_dao(db, task_model)
+        if isinstance(task_id_or_model, TushareDownloadTaskModel):
+            # 旧的方式：传入模型对象
+            task = task_id_or_model
+            task_id = task.task_id
+            if task_id is None:
+                raise ValueError('task_id不能为None')
+            task_dict = task.model_dump(
+                exclude={
+                    'task_id',
+                    'last_run_time', 'next_run_time', 'run_count', 'success_count', 'fail_count',
+                    'create_by', 'create_time'
+                },
+                exclude_none=False,
+                by_alias=False
+            )
+        else:
+            # 新的方式：直接传入task_id和字典
+            task_id = task_id_or_model
+            if task_dict is None:
+                raise ValueError('当使用task_id时，必须提供task_dict参数')
+        
+        logger.info(f'[DAO编辑任务] 开始更新，task_id: {task_id}')
+        logger.info(f'[DAO编辑任务] 接收到的字典: {task_dict}')
+        
+        # 从字典中移除 task_id，因为它只用于 WHERE 条件
+        update_dict = {k: v for k, v in task_dict.items() if k != 'task_id'}
+        # 再次排除不应该更新的字段
+        excluded_fields = {
+            'last_run_time', 'next_run_time', 'run_count', 'success_count', 'fail_count',
+            'create_by', 'create_time'
+        }
+        update_dict = {k: v for k, v in update_dict.items() if k not in excluded_fields}
+        
+        logger.info(f'[DAO编辑任务] 准备更新的字段字典: {update_dict}')
+        logger.info(f'[DAO编辑任务] 字典键: {list(update_dict.keys())}')
+        logger.info(f'[DAO编辑任务] cron_expression值: {update_dict.get("cron_expression")}, 类型: {type(update_dict.get("cron_expression"))}')
+        logger.info(f'[DAO编辑任务] task_name值: {update_dict.get("task_name")}')
+        
+        stmt = update(TushareDownloadTask).where(TushareDownloadTask.task_id == task_id).values(**update_dict)
+        logger.info(f'[DAO编辑任务] SQL语句: {stmt}')
+        
+        result = await db.execute(stmt)
+        logger.info(f'[DAO编辑任务] 执行结果: rowcount={result.rowcount}')
+        
+        if result.rowcount == 0:
+            logger.warning(f'[DAO编辑任务] 警告：没有更新任何记录，task_id: {task_id}')
+        
+        return task_id
 
     @classmethod
     async def delete_task_dao(cls, db: AsyncSession, task_ids: Sequence[int]) -> int:

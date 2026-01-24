@@ -271,10 +271,15 @@ async def edit_tushare_download_task(
     query_db: Annotated[AsyncSession, DBSessionDependency()],
     current_user: Annotated[CurrentUserModel, CurrentUserDependency()],
 ) -> Response:
+    logger.info(f'[控制器] 接收到编辑任务请求，task_id: {edit_download_task.task_id}')
+    logger.info(f'[控制器] 请求数据: {edit_download_task.model_dump(by_alias=True)}')
+    
     edit_download_task.update_by = current_user.user.user_name
     edit_download_task.update_time = datetime.now()
+    logger.info(f'[控制器] 设置更新信息: update_by={edit_download_task.update_by}, update_time={edit_download_task.update_time}')
+    
     edit_download_task_result = await TushareDownloadTaskService.edit_task_services(query_db, edit_download_task)
-    logger.info(edit_download_task_result.message)
+    logger.info(f'[控制器] 编辑结果: {edit_download_task_result.message}')
 
     return ResponseUtil.success(msg=edit_download_task_result.message)
 
