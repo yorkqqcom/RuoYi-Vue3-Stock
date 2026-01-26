@@ -797,8 +797,26 @@ async def execute_single_step(
                     table_name = f'tushare_{config.api_code}'
                 
                 await ensure_table_exists(session, table_name, config.api_code, df)
-                await TushareDataDao.add_dataframe_to_table_dao(session, table_name, df, task.task_id, config.config_id, config.api_code, download_date)
-                logger.info(f'步骤 {step.step_name} 已保存 {len(df)} 条数据到数据库表 {table_name}' + (f' (组合{combination_index})' if combination_index is not None else ''))
+                
+                # 从步骤配置中获取更新方式和唯一键字段
+                update_mode = getattr(step, 'update_mode', '0') or '0'
+                unique_key_fields = None
+                
+                # 解析唯一键字段配置（JSON格式）
+                if hasattr(step, 'unique_key_fields') and step.unique_key_fields and step.unique_key_fields.strip():
+                    try:
+                        unique_key_fields = json.loads(step.unique_key_fields)
+                        if not isinstance(unique_key_fields, list):
+                            unique_key_fields = None
+                    except (json.JSONDecodeError, TypeError):
+                        logger.warning(f'步骤 {step.step_name} 的唯一键字段配置格式错误，将使用自动检测')
+                        unique_key_fields = None
+                
+                await TushareDataDao.add_dataframe_to_table_dao(
+                    session, table_name, df, task.task_id, config.config_id, config.api_code, download_date,
+                    update_mode=update_mode, unique_key_fields=unique_key_fields
+                )
+                logger.info(f'步骤 {step.step_name} 已保存 {len(df)} 条数据到数据库表 {table_name}，更新模式: {update_mode}' + (f' (组合{combination_index})' if combination_index is not None else ''))
             except Exception as db_error:
                 error_detail = f'步骤 {step.step_name} 保存数据到数据库失败: {str(db_error)}'
                 logger.exception(error_detail)

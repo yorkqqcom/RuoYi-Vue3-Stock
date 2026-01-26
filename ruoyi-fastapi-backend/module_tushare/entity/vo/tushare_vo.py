@@ -335,6 +335,8 @@ class TushareWorkflowStepModel(BaseModel):
     layout_data: dict | list | None = Field(default=None, description='完整的布局数据（JSON格式，存储节点位置、连接线等可视化信息）')
     data_table_name: str | None = Field(default=None, description='数据存储表名（为空则使用任务配置的表名或默认表名）')
     loop_mode: Literal['0', '1'] | None = Field(default='0', description='遍历模式（0否 1是，开启后所有变量参数都会遍历）')
+    update_mode: Literal['0', '1', '2', '3'] | None = Field(default='0', description='数据更新方式（0仅插入 1忽略重复 2存在则更新 3先删除再插入）')
+    unique_key_fields: str | None = Field(default=None, description='唯一键字段配置（JSON格式，为空则自动检测）')
     status: Literal['0', '1'] | None = Field(default=None, description='状态（0正常 1停用）')
     create_by: str | None = Field(default=None, description='创建者')
     create_time: datetime | None = Field(default=None, description='创建时间')

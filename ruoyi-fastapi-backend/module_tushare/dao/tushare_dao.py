@@ -538,11 +538,70 @@ class TushareDataDao:
         return data_list
 
     @classmethod
+    async def detect_unique_keys(cls, db: AsyncSession, table_name: str) -> list[str]:
+        """
+        自动检测表的唯一键字段（主键或唯一索引）
+        
+        :param db: 数据库会话
+        :param table_name: 表名
+        :return: 唯一键字段列表
+        """
+        from sqlalchemy import text
+        from config.env import DataBaseConfig
+        import re
+        
+        # 验证表名，防止SQL注入
+        if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', table_name):
+            raise ValueError(f'无效的表名: {table_name}')
+        
+        unique_keys = []
+        
+        if DataBaseConfig.db_type == 'postgresql':
+            # PostgreSQL: 查询主键和唯一索引
+            query_sql = """
+                SELECT DISTINCT ccu.column_name
+                FROM information_schema.table_constraints tc
+                JOIN information_schema.constraint_column_usage ccu 
+                    ON tc.constraint_name = ccu.constraint_name
+                    AND tc.table_schema = ccu.table_schema
+                WHERE tc.table_schema = 'public'
+                    AND tc.table_name = :table_name
+                    AND tc.constraint_type IN ('PRIMARY KEY', 'UNIQUE')
+                ORDER BY ccu.column_name
+            """
+            result = await db.execute(text(query_sql), {'table_name': table_name})
+            unique_keys = [row[0] for row in result.fetchall()]
+        else:
+            # MySQL: 查询主键和唯一索引
+            query_sql = """
+                SELECT DISTINCT kcu.column_name
+                FROM information_schema.key_column_usage kcu
+                JOIN information_schema.table_constraints tc
+                    ON kcu.constraint_name = tc.constraint_name
+                    AND kcu.table_schema = tc.table_schema
+                    AND kcu.table_name = tc.table_name
+                WHERE kcu.table_schema = DATABASE()
+                    AND kcu.table_name = :table_name
+                    AND tc.constraint_type IN ('PRIMARY KEY', 'UNIQUE')
+                ORDER BY kcu.ordinal_position, kcu.column_name
+            """
+            result = await db.execute(text(query_sql), {'table_name': table_name})
+            unique_keys = [row[0] for row in result.fetchall()]
+        
+        return unique_keys
+
+    @classmethod
     async def add_dataframe_to_table_dao(
-        cls, db: AsyncSession, table_name: str, df: pd.DataFrame, task_id: int, config_id: int, api_code: str, download_date: str
+        cls, db: AsyncSession, table_name: str, df: pd.DataFrame, task_id: int, config_id: int, api_code: str, download_date: str,
+        update_mode: str = '0', unique_key_fields: list[str] | None = None
     ) -> int:
         """
         将 DataFrame 批量插入到指定表（表结构与 DataFrame 列一致）
+        支持多种更新模式：
+        - '0': INSERT（默认，仅插入，遇到重复会报错）
+        - '1': INSERT_IGNORE（忽略重复数据）
+        - '2': UPSERT（存在则更新，不存在则插入）
+        - '3': DELETE_INSERT（先删除再插入）
 
         :param db: orm对象
         :param table_name: 表名（需要验证，防止SQL注入）
@@ -551,10 +610,13 @@ class TushareDataDao:
         :param config_id: 配置ID
         :param api_code: 接口代码
         :param download_date: 下载日期
+        :param update_mode: 更新方式（'0': INSERT, '1': INSERT_IGNORE, '2': UPSERT, '3': DELETE_INSERT）
+        :param unique_key_fields: 唯一键字段列表（如果为None，则自动检测）
         :return: 插入的记录数
         """
         from sqlalchemy import text
         from config.env import DataBaseConfig
+        from utils.log_util import logger
         import json
         import re
         from datetime import datetime
@@ -571,25 +633,29 @@ class TushareDataDao:
         
         # 清理和验证 DataFrame 列名
         df_columns = []
+        col_mapping = {}  # 原始列名 -> 安全列名的映射
         for col in df.columns:
             safe_col = re.sub(r'[^a-zA-Z0-9_]', '_', str(col))
             if not safe_col or safe_col[0].isdigit():
                 safe_col = f'col_{safe_col}'
             df_columns.append(safe_col)
+            col_mapping[col] = safe_col
         
         all_columns = system_columns + df_columns
-        
-        # 构建 INSERT SQL
-        if DataBaseConfig.db_type == 'postgresql':
-            # PostgreSQL 使用命名参数
-            col_names = ', '.join([f'"{col}"' if col in df_columns else f'"{col}"' for col in all_columns])
-            placeholders = ', '.join([f':{col}' for col in all_columns])
-            insert_sql = f'INSERT INTO "{table_name}" ({col_names}) VALUES ({placeholders})'
-        else:
-            # MySQL 使用命名参数
-            col_names = ', '.join([f'`{col}`' for col in all_columns])
-            placeholders = ', '.join([f':{col}' for col in all_columns])
-            insert_sql = f'INSERT INTO `{table_name}` ({col_names}) VALUES ({placeholders})'
+
+        # 确定唯一键字段
+        if unique_key_fields is None or len(unique_key_fields) == 0:
+            # 自动检测唯一键
+            unique_key_fields = await cls.detect_unique_keys(db, table_name)
+            if unique_key_fields:
+                logger.info(f'自动检测到表 {table_name} 的唯一键字段: {unique_key_fields}')
+            else:
+                logger.warning(f'表 {table_name} 未检测到唯一键字段，某些更新模式可能无法正常工作')
+
+        # 如果 update_mode 是 '2' (UPSERT) 或 '3' (DELETE_INSERT)，需要唯一键
+        if update_mode in ['2', '3'] and not unique_key_fields:
+            logger.warning(f'更新模式 {update_mode} 需要唯一键字段，但未找到。将使用普通 INSERT 模式')
+            update_mode = '0'
 
         # 准备批量插入数据
         values_list = []
@@ -615,13 +681,192 @@ class TushareDataDao:
             
             values_list.append(row_dict)
 
-        # 执行批量插入
-        if values_list:
+        if not values_list:
+            return 0
+
+        # 根据更新模式构建和执行 SQL
+        if update_mode == '0':
+            # 普通 INSERT
+            if DataBaseConfig.db_type == 'postgresql':
+                col_names = ', '.join([f'"{col}"' for col in all_columns])
+                placeholders = ', '.join([f':{col}' for col in all_columns])
+                insert_sql = f'INSERT INTO "{table_name}" ({col_names}) VALUES ({placeholders})'
+            else:
+                col_names = ', '.join([f'`{col}`' for col in all_columns])
+                placeholders = ', '.join([f':{col}' for col in all_columns])
+                insert_sql = f'INSERT INTO `{table_name}` ({col_names}) VALUES ({placeholders})'
+            
             result = await db.execute(text(insert_sql), values_list)
             await db.flush()
             return len(values_list)
-        
-        return 0
+
+        elif update_mode == '1':
+            # INSERT_IGNORE
+            if DataBaseConfig.db_type == 'postgresql':
+                # PostgreSQL: ON CONFLICT DO NOTHING
+                if unique_key_fields:
+                    # 需要指定冲突的列
+                    conflict_cols = ', '.join([f'"{col}"' for col in unique_key_fields])
+                    col_names = ', '.join([f'"{col}"' for col in all_columns])
+                    placeholders = ', '.join([f':{col}' for col in all_columns])
+                    insert_sql = f'INSERT INTO "{table_name}" ({col_names}) VALUES ({placeholders}) ON CONFLICT ({conflict_cols}) DO NOTHING'
+                else:
+                    # 如果没有唯一键，使用普通 INSERT（PostgreSQL 没有 INSERT IGNORE）
+                    col_names = ', '.join([f'"{col}"' for col in all_columns])
+                    placeholders = ', '.join([f':{col}' for col in all_columns])
+                    insert_sql = f'INSERT INTO "{table_name}" ({col_names}) VALUES ({placeholders})'
+            else:
+                # MySQL: INSERT IGNORE
+                col_names = ', '.join([f'`{col}`' for col in all_columns])
+                placeholders = ', '.join([f':{col}' for col in all_columns])
+                insert_sql = f'INSERT IGNORE INTO `{table_name}` ({col_names}) VALUES ({placeholders})'
+            
+            result = await db.execute(text(insert_sql), values_list)
+            await db.flush()
+            return result.rowcount if hasattr(result, 'rowcount') else len(values_list)
+
+        elif update_mode == '2':
+            # UPSERT: 存在则更新，不存在则插入
+            if not unique_key_fields:
+                raise ValueError('UPSERT 模式需要唯一键字段')
+            
+            if DataBaseConfig.db_type == 'postgresql':
+                # PostgreSQL: ON CONFLICT DO UPDATE
+                conflict_cols = ', '.join([f'"{col}"' for col in unique_key_fields])
+                col_names = ', '.join([f'"{col}"' for col in all_columns])
+                placeholders = ', '.join([f':{col}' for col in all_columns])
+                # 构建 UPDATE SET 子句（排除唯一键字段）
+                update_cols = [col for col in all_columns if col not in unique_key_fields]
+                update_set = ', '.join([f'"{col}" = EXCLUDED."{col}"' for col in update_cols])
+                insert_sql = f'INSERT INTO "{table_name}" ({col_names}) VALUES ({placeholders}) ON CONFLICT ({conflict_cols}) DO UPDATE SET {update_set}'
+            else:
+                # MySQL: ON DUPLICATE KEY UPDATE
+                col_names = ', '.join([f'`{col}`' for col in all_columns])
+                placeholders = ', '.join([f':{col}' for col in all_columns])
+                # 构建 UPDATE SET 子句（排除唯一键字段）
+                update_cols = [col for col in all_columns if col not in unique_key_fields]
+                update_set = ', '.join([f'`{col}` = VALUES(`{col}`)' for col in update_cols])
+                insert_sql = f'INSERT INTO `{table_name}` ({col_names}) VALUES ({placeholders}) ON DUPLICATE KEY UPDATE {update_set}'
+            
+            result = await db.execute(text(insert_sql), values_list)
+            await db.flush()
+            return len(values_list)
+
+        elif update_mode == '3':
+            # DELETE_INSERT: 先删除再插入
+            if not unique_key_fields:
+                raise ValueError('DELETE_INSERT 模式需要唯一键字段')
+            
+            # 从 DataFrame 中提取唯一键的值
+            unique_key_values = []
+            for idx, row in df.iterrows():
+                key_dict = {}
+                for key_field in unique_key_fields:
+                    # 查找对应的 DataFrame 列
+                    found = False
+                    for orig_col, safe_col in col_mapping.items():
+                        if safe_col == key_field:
+                            value = row[orig_col]
+                            if pd.isna(value):
+                                key_dict[key_field] = None
+                            else:
+                                key_dict[key_field] = value
+                            found = True
+                            break
+                    if not found:
+                        # 如果找不到，可能是系统列
+                        if key_field in system_columns:
+                            if key_field == 'task_id':
+                                key_dict[key_field] = task_id
+                            elif key_field == 'config_id':
+                                key_dict[key_field] = config_id
+                            elif key_field == 'api_code':
+                                key_dict[key_field] = api_code
+                            elif key_field == 'download_date':
+                                key_dict[key_field] = download_date
+                if key_dict:
+                    unique_key_values.append(key_dict)
+            
+            # 构建 DELETE 语句
+            if unique_key_values:
+                if DataBaseConfig.db_type == 'postgresql':
+                    # PostgreSQL: 使用 IN 子句或 OR 条件
+                    delete_conditions = []
+                    for key_dict in unique_key_values:
+                        conditions = []
+                        for key_field, key_value in key_dict.items():
+                            if key_value is None:
+                                conditions.append(f'"{key_field}" IS NULL')
+                            else:
+                                conditions.append(f'"{key_field}" = :{key_field}_{len(delete_conditions)}')
+                        delete_conditions.append('(' + ' AND '.join(conditions) + ')')
+                    
+                    # 简化：使用 IN 子句（如果唯一键是单个字段）
+                    if len(unique_key_fields) == 1:
+                        key_field = unique_key_fields[0]
+                        key_values = [kv[key_field] for kv in unique_key_values if key_field in kv]
+                        if key_values:
+                            placeholders = ', '.join([f':val_{i}' for i in range(len(key_values))])
+                            delete_sql = f'DELETE FROM "{table_name}" WHERE "{key_field}" IN ({placeholders})'
+                            delete_params = {f'val_{i}': val for i, val in enumerate(key_values)}
+                            await db.execute(text(delete_sql), delete_params)
+                    else:
+                        # 多个字段的唯一键，需要逐个删除
+                        for key_dict in unique_key_values:
+                            conditions = []
+                            delete_params = {}
+                            for idx, (key_field, key_value) in enumerate(key_dict.items()):
+                                if key_value is None:
+                                    conditions.append(f'"{key_field}" IS NULL')
+                                else:
+                                    param_name = f'key_{idx}'
+                                    conditions.append(f'"{key_field}" = :{param_name}')
+                                    delete_params[param_name] = key_value
+                            delete_sql = f'DELETE FROM "{table_name}" WHERE ' + ' AND '.join(conditions)
+                            await db.execute(text(delete_sql), delete_params)
+                else:
+                    # MySQL: 使用 IN 子句
+                    if len(unique_key_fields) == 1:
+                        key_field = unique_key_fields[0]
+                        key_values = [kv[key_field] for kv in unique_key_values if key_field in kv]
+                        if key_values:
+                            placeholders = ', '.join([f':val_{i}' for i in range(len(key_values))])
+                            delete_sql = f'DELETE FROM `{table_name}` WHERE `{key_field}` IN ({placeholders})'
+                            delete_params = {f'val_{i}': val for i, val in enumerate(key_values)}
+                            await db.execute(text(delete_sql), delete_params)
+                    else:
+                        # 多个字段的唯一键，需要逐个删除
+                        for key_dict in unique_key_values:
+                            conditions = []
+                            delete_params = {}
+                            for idx, (key_field, key_value) in enumerate(key_dict.items()):
+                                if key_value is None:
+                                    conditions.append(f'`{key_field}` IS NULL')
+                                else:
+                                    param_name = f'key_{idx}'
+                                    conditions.append(f'`{key_field}` = :{param_name}')
+                                    delete_params[param_name] = key_value
+                            delete_sql = f'DELETE FROM `{table_name}` WHERE ' + ' AND '.join(conditions)
+                            await db.execute(text(delete_sql), delete_params)
+                
+                await db.flush()
+            
+            # 执行普通 INSERT
+            if DataBaseConfig.db_type == 'postgresql':
+                col_names = ', '.join([f'"{col}"' for col in all_columns])
+                placeholders = ', '.join([f':{col}' for col in all_columns])
+                insert_sql = f'INSERT INTO "{table_name}" ({col_names}) VALUES ({placeholders})'
+            else:
+                col_names = ', '.join([f'`{col}`' for col in all_columns])
+                placeholders = ', '.join([f':{col}' for col in all_columns])
+                insert_sql = f'INSERT INTO `{table_name}` ({col_names}) VALUES ({placeholders})'
+            
+            result = await db.execute(text(insert_sql), values_list)
+            await db.flush()
+            return len(values_list)
+
+        else:
+            raise ValueError(f'不支持的更新模式: {update_mode}')
 
     @classmethod
     async def add_data_batch_to_table_dao(

@@ -43,7 +43,9 @@ drop table if exists tushare_download_task;
 create table tushare_download_task (
   task_id             bigserial      not null,
   task_name           varchar(100)   not null,
-  config_id           bigint         not null,
+  config_id           bigint,
+  workflow_id         bigint,
+  task_type           varchar(20)    default 'single',
   cron_expression     varchar(255),
   start_date          varchar(20),
   end_date            varchar(20),
@@ -67,9 +69,13 @@ create table tushare_download_task (
   constraint uk_task_name unique (task_name)
 );
 create index idx_config_id on tushare_download_task(config_id);
+create index idx_workflow_id_task on tushare_download_task(workflow_id);
+create index idx_task_type on tushare_download_task(task_type);
 comment on column tushare_download_task.task_id is '任务ID';
 comment on column tushare_download_task.task_name is '任务名称';
-comment on column tushare_download_task.config_id is '接口配置ID';
+comment on column tushare_download_task.config_id is '接口配置ID（流程配置模式下可以为空）';
+comment on column tushare_download_task.workflow_id is '流程配置ID（如果存在则执行流程，否则执行单个接口）';
+comment on column tushare_download_task.task_type is '任务类型（single:单个接口 workflow:流程配置）';
 comment on column tushare_download_task.cron_expression is 'cron执行表达式';
 comment on column tushare_download_task.start_date is '开始日期（YYYYMMDD）';
 comment on column tushare_download_task.end_date is '结束日期（YYYYMMDD）';
@@ -197,6 +203,13 @@ create table tushare_workflow_step (
   config_id            bigint         not null,
   step_params          text,
   condition_expr       text,
+  position_x           integer,
+  position_y           integer,
+  node_type            varchar(20)    default 'task',
+  source_step_ids      text,
+  target_step_ids      text,
+  layout_data          jsonb,
+  data_table_name      varchar(100),
   status               char(1)        default '0',
   create_by            varchar(64)    default '',
   create_time          timestamp(0),
@@ -215,6 +228,13 @@ comment on column tushare_workflow_step.step_name is '步骤名称';
 comment on column tushare_workflow_step.config_id is '接口配置ID';
 comment on column tushare_workflow_step.step_params is '步骤参数（JSON格式，可从前一步获取数据）';
 comment on column tushare_workflow_step.condition_expr is '执行条件（JSON格式，可选）';
+comment on column tushare_workflow_step.position_x is '节点X坐标（用于可视化布局）';
+comment on column tushare_workflow_step.position_y is '节点Y坐标（用于可视化布局）';
+comment on column tushare_workflow_step.node_type is '节点类型（start/end/task）';
+comment on column tushare_workflow_step.source_step_ids is '前置步骤ID列表（JSON格式，支持多个前置节点）';
+comment on column tushare_workflow_step.target_step_ids is '后置步骤ID列表（JSON格式，支持多个后置节点）';
+comment on column tushare_workflow_step.layout_data is '完整的布局数据（JSONB格式，存储节点位置、连接线等可视化信息）';
+comment on column tushare_workflow_step.data_table_name is '数据存储表名（为空则使用任务配置的表名或默认表名）';
 comment on column tushare_workflow_step.status is '状态（0正常 1停用）';
 comment on column tushare_workflow_step.create_by is '创建者';
 comment on column tushare_workflow_step.create_time is '创建时间';
@@ -222,41 +242,3 @@ comment on column tushare_workflow_step.update_by is '更新者';
 comment on column tushare_workflow_step.update_time is '更新时间';
 comment on column tushare_workflow_step.remark is '备注信息';
 comment on table tushare_workflow_step is 'Tushare流程步骤表';
-
--- ----------------------------
--- 修改下载任务表，添加流程配置支持
--- ----------------------------
-alter table tushare_download_task add column workflow_id bigint;
-comment on column tushare_download_task.workflow_id is '流程配置ID（如果存在则执行流程，否则执行单个接口）';
-create index idx_workflow_id_task on tushare_download_task(workflow_id);
-
--- ----------------------------
--- 修改下载任务表，添加任务类型字段
--- ----------------------------
-alter table tushare_download_task add column task_type varchar(20) default 'single';
-comment on column tushare_download_task.task_type is '任务类型（single:单个接口 workflow:流程配置）';
-create index idx_task_type on tushare_download_task(task_type);
-
--- ----------------------------
--- 修改下载任务表，允许config_id为空（流程配置模式下可以为空）
--- ----------------------------
-alter table tushare_download_task alter column config_id drop not null;
-comment on column tushare_download_task.config_id is '接口配置ID';
-
--- ----------------------------
--- 扩展流程步骤表，添加可视化编辑器支持字段
--- ----------------------------
-alter table tushare_workflow_step add column position_x integer;
-comment on column tushare_workflow_step.position_x is '节点X坐标（用于可视化布局）';
-alter table tushare_workflow_step add column position_y integer;
-comment on column tushare_workflow_step.position_y is '节点Y坐标（用于可视化布局）';
-alter table tushare_workflow_step add column node_type varchar(20) default 'task';
-comment on column tushare_workflow_step.node_type is '节点类型（start/end/task）';
-alter table tushare_workflow_step add column source_step_ids text;
-comment on column tushare_workflow_step.source_step_ids is '前置步骤ID列表（JSON格式，支持多个前置节点）';
-alter table tushare_workflow_step add column target_step_ids text;
-comment on column tushare_workflow_step.target_step_ids is '后置步骤ID列表（JSON格式，支持多个后置节点）';
-alter table tushare_workflow_step add column layout_data jsonb;
-comment on column tushare_workflow_step.layout_data is '完整的布局数据（JSONB格式，存储节点位置、连接线等可视化信息）';
-alter table tushare_workflow_step add column data_table_name varchar(100);
-comment on column tushare_workflow_step.data_table_name is '数据存储表名（为空则使用任务配置的表名或默认表名）';
