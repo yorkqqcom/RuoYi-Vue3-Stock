@@ -917,10 +917,21 @@ class TushareWorkflowStepDao:
         :param step: 步骤对象
         :return: 编辑结果
         """
+        # 获取步骤字典，但确保 step_params 字段即使为 None 也要包含
+        # 先获取包含所有字段的字典（不排除 None）
+        step_dict_all = step.model_dump(exclude={'step_id'}, exclude_none=False)
+        # 然后获取排除 None 的字典（用于其他字段）
+        step_dict = step.model_dump(exclude={'step_id'}, exclude_none=True)
+        
+        # 对于 step_params 字段，即使为 None 也要包含（允许清空参数）
+        # 从完整字典中获取 step_params，确保即使为 None 也会被包含
+        if 'step_params' in step_dict_all:
+            step_dict['step_params'] = step_dict_all['step_params']
+        
         await db.execute(
             update(TushareWorkflowStep)
             .where(TushareWorkflowStep.step_id == step.step_id)
-            .values(**step.model_dump(exclude={'step_id'}, exclude_none=True))
+            .values(**step_dict)
         )
         return step.step_id
 

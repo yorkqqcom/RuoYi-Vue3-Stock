@@ -307,6 +307,8 @@ class DeleteTushareWorkflowConfigModel(BaseModel):
     删除Tushare流程配置模型
     """
 
+    model_config = ConfigDict(alias_generator=to_camel, from_attributes=True)
+
     workflow_ids: str = Field(description='需要删除的流程ID')
 
 
@@ -332,6 +334,7 @@ class TushareWorkflowStepModel(BaseModel):
     target_step_ids: str | None = Field(default=None, description='后置步骤ID列表（JSON格式，支持多个后置节点）')
     layout_data: dict | list | None = Field(default=None, description='完整的布局数据（JSON格式，存储节点位置、连接线等可视化信息）')
     data_table_name: str | None = Field(default=None, description='数据存储表名（为空则使用任务配置的表名或默认表名）')
+    loop_mode: Literal['0', '1'] | None = Field(default='0', description='遍历模式（0否 1是，开启后所有变量参数都会遍历）')
     status: Literal['0', '1'] | None = Field(default=None, description='状态（0正常 1停用）')
     create_by: str | None = Field(default=None, description='创建者')
     create_time: datetime | None = Field(default=None, description='创建时间')

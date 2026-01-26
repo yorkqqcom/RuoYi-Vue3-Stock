@@ -954,6 +954,54 @@ class TushareWorkflowStepService:
         return step_list_result
 
     @classmethod
+    def _normalize_step_params(cls, step_params: str | dict | None) -> str | None:
+        """
+        规范化步骤参数，确保是有效的JSON字符串或None
+        
+        :param step_params: 步骤参数（可能是字符串、字典或None）
+        :return: 规范化后的JSON字符串或None
+        """
+        import json
+        from utils.log_util import logger
+        
+        if step_params is None:
+            return None
+        
+        # 如果是空字符串，返回None
+        if isinstance(step_params, str) and not step_params.strip():
+            return None
+        
+        # 如果是字典，转换为JSON字符串
+        if isinstance(step_params, dict):
+            try:
+                return json.dumps(step_params, ensure_ascii=False)
+            except Exception as e:
+                logger.error(f'步骤参数字典转换为JSON失败: {e}')
+                raise ServiceException(message=f'步骤参数格式错误: {str(e)}')
+        
+        # 如果是字符串，验证是否为有效的JSON
+        if isinstance(step_params, str):
+            try:
+                # 验证JSON格式
+                parsed = json.loads(step_params)
+                # 确保解析后是字典（步骤参数应该是对象）
+                if not isinstance(parsed, dict):
+                    logger.warning(f'步骤参数不是对象格式: {type(parsed)}')
+                    raise ServiceException(message='步骤参数必须是JSON对象格式')
+                # 重新序列化以确保格式正确
+                return json.dumps(parsed, ensure_ascii=False)
+            except json.JSONDecodeError as e:
+                logger.error(f'步骤参数JSON格式错误: {e}, 内容: {step_params[:100]}')
+                raise ServiceException(message=f'步骤参数JSON格式错误: {str(e)}')
+            except Exception as e:
+                logger.error(f'步骤参数验证失败: {e}')
+                raise ServiceException(message=f'步骤参数验证失败: {str(e)}')
+        
+        # 其他类型不支持
+        logger.error(f'步骤参数类型不支持: {type(step_params)}')
+        raise ServiceException(message=f'步骤参数类型不支持: {type(step_params)}')
+
+    @classmethod
     async def add_step_services(
         cls, query_db: AsyncSession, page_object: TushareWorkflowStepModel
     ) -> CrudResponseModel:
@@ -965,6 +1013,11 @@ class TushareWorkflowStepService:
         :return: 新增流程步骤校验结果
         """
         try:
+            # 规范化步骤参数（无论是否为 None 都要处理）
+            if hasattr(page_object, 'step_params'):
+                # 规范化会处理 None、空字符串、字典、字符串等各种情况
+                page_object.step_params = cls._normalize_step_params(page_object.step_params)
+            
             add_step = await TushareWorkflowStepDao.add_step_dao(query_db, page_object)
             await query_db.commit()
             result = {'is_success': True, 'message': '新增成功'}
@@ -986,6 +1039,10 @@ class TushareWorkflowStepService:
         :return: 编辑流程步骤校验结果
         """
         try:
+            # 规范化步骤参数
+            if hasattr(page_object, 'step_params') and page_object.step_params is not None:
+                page_object.step_params = cls._normalize_step_params(page_object.step_params)
+            
             result_id = await TushareWorkflowStepDao.edit_step_dao(query_db, page_object)
             await query_db.commit()
             result = {'is_success': True, 'message': '编辑成功'}
@@ -1042,6 +1099,10 @@ class TushareWorkflowStepService:
             
             # 创建步骤
             for step_model in create_list:
+                # 规范化步骤参数（包括 None 和空字符串的处理）
+                if hasattr(step_model, 'step_params'):
+                    step_model.step_params = cls._normalize_step_params(step_model.step_params)
+                
                 step_model.create_by = user_name
                 step_model.create_time = datetime.now()
                 step_model.update_by = user_name
@@ -1050,6 +1111,11 @@ class TushareWorkflowStepService:
             
             # 更新步骤
             for step_model in update_list:
+                # 规范化步骤参数（包括 None 和空字符串的处理）
+                # 注意：即使 step_params 是 None，也要规范化（确保是 None 而不是空字符串）
+                if hasattr(step_model, 'step_params'):
+                    step_model.step_params = cls._normalize_step_params(step_model.step_params)
+                
                 step_model.update_by = user_name
                 step_model.update_time = datetime.now()
                 await TushareWorkflowStepDao.edit_step_dao(query_db, step_model)

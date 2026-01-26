@@ -153,6 +153,7 @@ class TushareWorkflowStep(Base):
     else:
         layout_data = Column(JSON, nullable=True, comment='完整的布局数据（JSON格式，存储节点位置、连接线等可视化信息）')
     data_table_name = Column(String(100), nullable=True, comment='数据存储表名（为空则使用任务配置的表名或默认表名）')
+    loop_mode = Column(CHAR(1), nullable=True, server_default='0', comment='遍历模式（0否 1是，开启后所有变量参数都会遍历）')
     status = Column(CHAR(1), nullable=True, server_default='0', comment='状态（0正常 1停用）')
     create_by = Column(String(64), nullable=True, server_default="''", comment='创建者')
     create_time = Column(DateTime, nullable=True, default=datetime.now(), comment='创建时间')
