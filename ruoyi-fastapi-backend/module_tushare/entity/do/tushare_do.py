@@ -40,7 +40,9 @@ class TushareDownloadTask(Base):
 
     task_id = Column(BigInteger, primary_key=True, nullable=False, autoincrement=True, comment='任务ID')
     task_name = Column(String(100), nullable=False, comment='任务名称')
-    config_id = Column(BigInteger, nullable=False, comment='接口配置ID')
+    config_id = Column(BigInteger, nullable=True, comment='接口配置ID')
+    workflow_id = Column(BigInteger, nullable=True, comment='流程配置ID（如果存在则执行流程，否则执行单个接口）')
+    task_type = Column(String(20), nullable=True, server_default='single', comment='任务类型（single:单个接口 workflow:流程配置）')
     cron_expression = Column(String(255), nullable=True, comment='cron执行表达式')
     start_date = Column(String(20), nullable=True, comment='开始日期（YYYYMMDD）')
     end_date = Column(String(20), nullable=True, comment='结束日期（YYYYMMDD）')
@@ -103,3 +105,57 @@ class TushareData(Base):
     else:
         data_content = Column(JSON, nullable=True, comment='数据内容（JSON格式）')
     create_time = Column(DateTime, nullable=True, default=datetime.now(), comment='创建时间')
+
+
+class TushareWorkflowConfig(Base):
+    """
+    Tushare流程配置表
+    """
+
+    __tablename__ = 'tushare_workflow_config'
+    __table_args__ = {'comment': 'Tushare流程配置表'}
+
+    workflow_id = Column(BigInteger, primary_key=True, nullable=False, autoincrement=True, comment='流程ID')
+    workflow_name = Column(String(100), nullable=False, comment='流程名称')
+    workflow_desc = Column(Text, nullable=True, comment='流程描述')
+    status = Column(CHAR(1), nullable=True, server_default='0', comment='状态（0正常 1停用）')
+    create_by = Column(String(64), nullable=True, server_default="''", comment='创建者')
+    create_time = Column(DateTime, nullable=True, default=datetime.now(), comment='创建时间')
+    update_by = Column(String(64), nullable=True, server_default="''", comment='更新者')
+    update_time = Column(DateTime, nullable=True, default=datetime.now(), comment='更新时间')
+    remark = Column(String(500), nullable=True, server_default="''", comment='备注信息')
+
+
+class TushareWorkflowStep(Base):
+    """
+    Tushare流程步骤表
+    """
+
+    __tablename__ = 'tushare_workflow_step'
+    __table_args__ = {'comment': 'Tushare流程步骤表'}
+
+    step_id = Column(BigInteger, primary_key=True, nullable=False, autoincrement=True, comment='步骤ID')
+    workflow_id = Column(BigInteger, nullable=False, comment='流程ID')
+    step_order = Column(Integer, nullable=False, comment='步骤顺序（从1开始）')
+    step_name = Column(String(100), nullable=False, comment='步骤名称')
+    config_id = Column(BigInteger, nullable=False, comment='接口配置ID')
+    step_params = Column(Text, nullable=True, comment='步骤参数（JSON格式，可从前一步获取数据）')
+    condition_expr = Column(Text, nullable=True, comment='执行条件（JSON格式，可选）')
+    # 可视化编辑器相关字段
+    position_x = Column(Integer, nullable=True, comment='节点X坐标（用于可视化布局）')
+    position_y = Column(Integer, nullable=True, comment='节点Y坐标（用于可视化布局）')
+    node_type = Column(String(20), nullable=True, server_default='task', comment='节点类型（start/end/task）')
+    source_step_ids = Column(Text, nullable=True, comment='前置步骤ID列表（JSON格式，支持多个前置节点）')
+    target_step_ids = Column(Text, nullable=True, comment='后置步骤ID列表（JSON格式，支持多个后置节点）')
+    # 根据数据库类型选择 JSON 或 JSONB
+    if DataBaseConfig.db_type == 'postgresql':
+        layout_data = Column(JSONB, nullable=True, comment='完整的布局数据（JSONB格式，存储节点位置、连接线等可视化信息）')
+    else:
+        layout_data = Column(JSON, nullable=True, comment='完整的布局数据（JSON格式，存储节点位置、连接线等可视化信息）')
+    data_table_name = Column(String(100), nullable=True, comment='数据存储表名（为空则使用任务配置的表名或默认表名）')
+    status = Column(CHAR(1), nullable=True, server_default='0', comment='状态（0正常 1停用）')
+    create_by = Column(String(64), nullable=True, server_default="''", comment='创建者')
+    create_time = Column(DateTime, nullable=True, default=datetime.now(), comment='创建时间')
+    update_by = Column(String(64), nullable=True, server_default="''", comment='更新者')
+    update_time = Column(DateTime, nullable=True, default=datetime.now(), comment='更新时间')
+    remark = Column(String(500), nullable=True, server_default="''", comment='备注信息')

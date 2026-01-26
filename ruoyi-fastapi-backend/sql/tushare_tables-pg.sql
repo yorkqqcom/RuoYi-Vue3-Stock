@@ -156,3 +156,107 @@ comment on column tushare_data.download_date is '下载日期（YYYYMMDD）';
 comment on column tushare_data.data_content is '数据内容（JSONB格式）';
 comment on column tushare_data.create_time is '创建时间';
 comment on table tushare_data is 'Tushare数据存储表（通用表）';
+
+-- ----------------------------
+-- 5、Tushare流程配置表
+-- ----------------------------
+drop table if exists tushare_workflow_config;
+create table tushare_workflow_config (
+  workflow_id          bigserial      not null,
+  workflow_name        varchar(100)   not null,
+  workflow_desc        text,
+  status               char(1)        default '0',
+  create_by            varchar(64)    default '',
+  create_time          timestamp(0),
+  update_by            varchar(64)    default '',
+  update_time          timestamp(0),
+  remark               varchar(500)   default '',
+  primary key (workflow_id),
+  constraint uk_workflow_name unique (workflow_name)
+);
+comment on column tushare_workflow_config.workflow_id is '流程ID';
+comment on column tushare_workflow_config.workflow_name is '流程名称';
+comment on column tushare_workflow_config.workflow_desc is '流程描述';
+comment on column tushare_workflow_config.status is '状态（0正常 1停用）';
+comment on column tushare_workflow_config.create_by is '创建者';
+comment on column tushare_workflow_config.create_time is '创建时间';
+comment on column tushare_workflow_config.update_by is '更新者';
+comment on column tushare_workflow_config.update_time is '更新时间';
+comment on column tushare_workflow_config.remark is '备注信息';
+comment on table tushare_workflow_config is 'Tushare流程配置表';
+
+-- ----------------------------
+-- 6、Tushare流程步骤表
+-- ----------------------------
+drop table if exists tushare_workflow_step;
+create table tushare_workflow_step (
+  step_id              bigserial      not null,
+  workflow_id          bigint         not null,
+  step_order           integer        not null,
+  step_name            varchar(100)   not null,
+  config_id            bigint         not null,
+  step_params          text,
+  condition_expr       text,
+  status               char(1)        default '0',
+  create_by            varchar(64)    default '',
+  create_time          timestamp(0),
+  update_by            varchar(64)    default '',
+  update_time          timestamp(0),
+  remark               varchar(500)   default '',
+  primary key (step_id)
+);
+create index idx_workflow_id_step on tushare_workflow_step(workflow_id);
+create index idx_config_id_step on tushare_workflow_step(config_id);
+create unique index uk_workflow_step_order on tushare_workflow_step(workflow_id, step_order);
+comment on column tushare_workflow_step.step_id is '步骤ID';
+comment on column tushare_workflow_step.workflow_id is '流程ID';
+comment on column tushare_workflow_step.step_order is '步骤顺序（从1开始）';
+comment on column tushare_workflow_step.step_name is '步骤名称';
+comment on column tushare_workflow_step.config_id is '接口配置ID';
+comment on column tushare_workflow_step.step_params is '步骤参数（JSON格式，可从前一步获取数据）';
+comment on column tushare_workflow_step.condition_expr is '执行条件（JSON格式，可选）';
+comment on column tushare_workflow_step.status is '状态（0正常 1停用）';
+comment on column tushare_workflow_step.create_by is '创建者';
+comment on column tushare_workflow_step.create_time is '创建时间';
+comment on column tushare_workflow_step.update_by is '更新者';
+comment on column tushare_workflow_step.update_time is '更新时间';
+comment on column tushare_workflow_step.remark is '备注信息';
+comment on table tushare_workflow_step is 'Tushare流程步骤表';
+
+-- ----------------------------
+-- 修改下载任务表，添加流程配置支持
+-- ----------------------------
+alter table tushare_download_task add column workflow_id bigint;
+comment on column tushare_download_task.workflow_id is '流程配置ID（如果存在则执行流程，否则执行单个接口）';
+create index idx_workflow_id_task on tushare_download_task(workflow_id);
+
+-- ----------------------------
+-- 修改下载任务表，添加任务类型字段
+-- ----------------------------
+alter table tushare_download_task add column task_type varchar(20) default 'single';
+comment on column tushare_download_task.task_type is '任务类型（single:单个接口 workflow:流程配置）';
+create index idx_task_type on tushare_download_task(task_type);
+
+-- ----------------------------
+-- 修改下载任务表，允许config_id为空（流程配置模式下可以为空）
+-- ----------------------------
+alter table tushare_download_task alter column config_id drop not null;
+comment on column tushare_download_task.config_id is '接口配置ID';
+
+-- ----------------------------
+-- 扩展流程步骤表，添加可视化编辑器支持字段
+-- ----------------------------
+alter table tushare_workflow_step add column position_x integer;
+comment on column tushare_workflow_step.position_x is '节点X坐标（用于可视化布局）';
+alter table tushare_workflow_step add column position_y integer;
+comment on column tushare_workflow_step.position_y is '节点Y坐标（用于可视化布局）';
+alter table tushare_workflow_step add column node_type varchar(20) default 'task';
+comment on column tushare_workflow_step.node_type is '节点类型（start/end/task）';
+alter table tushare_workflow_step add column source_step_ids text;
+comment on column tushare_workflow_step.source_step_ids is '前置步骤ID列表（JSON格式，支持多个前置节点）';
+alter table tushare_workflow_step add column target_step_ids text;
+comment on column tushare_workflow_step.target_step_ids is '后置步骤ID列表（JSON格式，支持多个后置节点）';
+alter table tushare_workflow_step add column layout_data jsonb;
+comment on column tushare_workflow_step.layout_data is '完整的布局数据（JSONB格式，存储节点位置、连接线等可视化信息）';
+alter table tushare_workflow_step add column data_table_name varchar(100);
+comment on column tushare_workflow_step.data_table_name is '数据存储表名（为空则使用任务配置的表名或默认表名）';

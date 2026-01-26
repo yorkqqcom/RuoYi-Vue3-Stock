@@ -32,3 +32,24 @@ insert into sys_menu values(2114, '下载任务状态修改', 2002, 5, '', '', '
 -- 下载日志按钮
 insert into sys_menu values(2120, '下载日志查询', 2003, 1, '', '', '', '', 1, 0, 'F', '0', '0', 'tushare:downloadLog:list', '#', 'admin', current_timestamp, '', null, '');
 insert into sys_menu values(2121, '下载日志删除', 2003, 2, '', '', '', '', 1, 0, 'F', '0', '0', 'tushare:downloadLog:remove', '#', 'admin', current_timestamp, '', null, '');
+
+-- 二级菜单：流程配置管理
+insert into sys_menu values(2004, '流程配置', 2000, 4, 'workflowConfig', 'tushare/workflowConfig/index', '', '', 1, 0, 'C', '0', '0', 'tushare:workflowConfig:list', 'tree', 'admin', current_timestamp, '', null, 'Tushare流程配置菜单');
+
+-- 二级菜单：流程步骤管理
+insert into sys_menu values(2005, '流程步骤', 2000, 5, 'workflowStep', 'tushare/workflowStep/index', '', '', 1, 0, 'C', '0', '0', 'tushare:workflowStep:list', 'tree-table', 'admin', current_timestamp, '', null, 'Tushare流程步骤菜单');
+
+-- 流程配置按钮
+insert into sys_menu values(2130, '流程配置查询', 2004, 1, '', '', '', '', 1, 0, 'F', '0', '0', 'tushare:workflowConfig:query', '#', 'admin', current_timestamp, '', null, '');
+insert into sys_menu values(2131, '流程配置新增', 2004, 2, '', '', '', '', 1, 0, 'F', '0', '0', 'tushare:workflowConfig:add', '#', 'admin', current_timestamp, '', null, '');
+insert into sys_menu values(2132, '流程配置修改', 2004, 3, '', '', '', '', 1, 0, 'F', '0', '0', 'tushare:workflowConfig:edit', '#', 'admin', current_timestamp, '', null, '');
+insert into sys_menu values(2133, '流程配置删除', 2004, 4, '', '', '', '', 1, 0, 'F', '0', '0', 'tushare:workflowConfig:remove', '#', 'admin', current_timestamp, '', null, '');
+
+-- 流程步骤按钮
+insert into sys_menu values(2140, '流程步骤查询', 2005, 1, '', '', '', '', 1, 0, 'F', '0', '0', 'tushare:workflowStep:list', '#', 'admin', current_timestamp, '', null, '');
+insert into sys_menu values(2141, '流程步骤新增', 2005, 2, '', '', '', '', 1, 0, 'F', '0', '0', 'tushare:workflowStep:add', '#', 'admin', current_timestamp, '', null, '');
+insert into sys_menu values(2142, '流程步骤修改', 2005, 3, '', '', '', '', 1, 0, 'F', '0', '0', 'tushare:workflowStep:edit', '#', 'admin', current_timestamp, '', null, '');
+insert into sys_menu values(2143, '流程步骤删除', 2005, 4, '', '', '', '', 1, 0, 'F', '0', '0', 'tushare:workflowStep:remove', '#', 'admin', current_timestamp, '', null, '');
+
+-- 下载任务执行按钮（补充）
+insert into sys_menu values(2115, '下载任务执行', 2002, 6, '', '', '', '', 1, 0, 'F', '0', '0', 'tushare:downloadTask:execute', '#', 'admin', current_timestamp, '', null, '');

@@ -10,6 +10,17 @@
                @keyup.enter="handleQuery"
             />
          </el-form-item>
+         <el-form-item label="任务类型" prop="taskType">
+            <el-select
+               v-model="queryParams.taskType"
+               placeholder="请选择任务类型"
+               clearable
+               style="width: 240px"
+            >
+               <el-option label="单个接口" value="single" />
+               <el-option label="流程配置" value="workflow" />
+            </el-select>
+         </el-form-item>
          <el-form-item label="执行状态" prop="status">
             <el-select
                v-model="queryParams.status"
@@ -67,7 +78,20 @@
       <el-table v-loading="loading" :data="logList" @selection-change="handleSelectionChange">
          <el-table-column type="selection" width="55" align="center" />
          <el-table-column label="日志ID" width="100" align="center" prop="logId" />
+         <el-table-column label="任务类型" align="center" width="120">
+            <template #default="scope">
+               <el-tag :type="scope.row.taskType === 'workflow' ? 'success' : 'info'" size="small">
+                  {{ scope.row.taskType === 'workflow' ? '流程配置' : '单个接口' }}
+               </el-tag>
+            </template>
+         </el-table-column>
          <el-table-column label="任务名称" align="center" prop="taskName" :show-overflow-tooltip="true" />
+         <el-table-column label="步骤名称" align="center" width="120" v-if="hasWorkflowLog">
+            <template #default="scope">
+               <span v-if="scope.row.stepName" style="color: #409eff;">{{ scope.row.stepName }}</span>
+               <span v-else style="color: #909399;">-</span>
+            </template>
+         </el-table-column>
          <el-table-column label="接口名称" align="center" prop="apiName" :show-overflow-tooltip="true" />
          <el-table-column label="下载日期" align="center" prop="downloadDate" width="120" />
          <el-table-column label="记录数" align="center" prop="recordCount" width="100" />
@@ -110,9 +134,17 @@
                <el-col :span="12">
                   <el-form-item label="日志ID：">{{ form.logId }}</el-form-item>
                   <el-form-item label="任务名称：">{{ form.taskName }}</el-form-item>
+                  <el-form-item label="任务类型：">
+                     <el-tag :type="form.taskType === 'workflow' ? 'success' : 'info'" size="small">
+                        {{ form.taskType === 'workflow' ? '流程配置' : '单个接口' }}
+                     </el-tag>
+                  </el-form-item>
                </el-col>
                <el-col :span="12">
                   <el-form-item label="接口名称：">{{ form.apiName }}</el-form-item>
+                  <el-form-item label="步骤名称：" v-if="form.stepName">
+                     <el-tag type="primary" size="small">{{ form.stepName }}</el-tag>
+                  </el-form-item>
                   <el-form-item label="执行时间：">{{ parseTime(form.createTime) }}</el-form-item>
                </el-col>
                <el-col :span="12">
@@ -179,9 +211,12 @@ const data = reactive({
     pageNum: 1,
     pageSize: 10,
     taskName: undefined,
+    taskType: undefined,
     status: undefined
   }
 });
+
+const hasWorkflowLog = ref(false);
 
 const { queryParams, form } = toRefs(data);
 
@@ -191,6 +226,8 @@ function getList() {
   listDownloadLog(proxy.addDateRange(queryParams.value, dateRange.value)).then(response => {
     logList.value = response.rows;
     total.value = response.total;
+    // 检查是否有流程配置任务的日志
+    hasWorkflowLog.value = response.rows.some(log => log.taskType === 'workflow');
     loading.value = false;
   });
 }

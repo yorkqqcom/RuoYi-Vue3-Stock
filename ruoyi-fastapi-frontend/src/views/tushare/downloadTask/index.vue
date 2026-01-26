@@ -20,6 +20,22 @@
                />
             </el-select>
          </el-form-item>
+         <el-form-item label="流程配置" prop="workflowId">
+            <el-select v-model="queryParams.workflowId" placeholder="请选择流程配置" clearable style="width: 200px">
+               <el-option
+                  v-for="workflow in workflowConfigOptions"
+                  :key="workflow.workflowId"
+                  :label="workflow.workflowName"
+                  :value="workflow.workflowId"
+               />
+            </el-select>
+         </el-form-item>
+         <el-form-item label="任务类型" prop="taskType">
+            <el-select v-model="queryParams.taskType" placeholder="请选择任务类型" clearable style="width: 200px">
+               <el-option label="单个接口" value="single" />
+               <el-option label="流程配置" value="workflow" />
+            </el-select>
+         </el-form-item>
          <el-form-item label="状态" prop="status">
             <el-select v-model="queryParams.status" placeholder="请选择状态" clearable style="width: 200px">
                <el-option
@@ -73,9 +89,23 @@
          <el-table-column type="selection" width="55" align="center" />
          <el-table-column label="任务ID" width="100" align="center" prop="taskId" />
          <el-table-column label="任务名称" align="center" prop="taskName" :show-overflow-tooltip="true" />
+         <el-table-column label="任务类型" align="center" width="120">
+            <template #default="scope">
+               <el-tag :type="scope.row.taskType === 'workflow' ? 'success' : 'info'">
+                  {{ scope.row.taskType === 'workflow' ? '流程配置' : '单个接口' }}
+               </el-tag>
+            </template>
+         </el-table-column>
          <el-table-column label="接口配置" align="center" prop="configId" :show-overflow-tooltip="true">
             <template #default="scope">
-               <span>{{ getApiConfigName(scope.row.configId) }}</span>
+               <span v-if="!scope.row.workflowId">{{ getApiConfigName(scope.row.configId) }}</span>
+               <span v-else style="color: #909399;">流程模式</span>
+            </template>
+         </el-table-column>
+         <el-table-column label="流程配置" align="center" prop="workflowId" :show-overflow-tooltip="true">
+            <template #default="scope">
+               <span v-if="scope.row.workflowId">{{ getWorkflowConfigName(scope.row.workflowId) }}</span>
+               <span v-else style="color: #909399;">-</span>
             </template>
          </el-table-column>
          <el-table-column label="日期范围" align="center" :show-overflow-tooltip="true">
@@ -112,10 +142,13 @@
                <span>{{ parseTime(scope.row.lastRunTime) }}</span>
             </template>
          </el-table-column>
-         <el-table-column label="操作" align="center" width="250" class-name="small-padding fixed-width">
+         <el-table-column label="操作" align="center" width="320" class-name="small-padding fixed-width">
             <template #default="scope">
                <el-tooltip content="执行" placement="top">
                   <el-button link type="success" icon="VideoPlay" @click="handleExecute(scope.row)" v-hasPermi="['tushare:downloadTask:execute']"></el-button>
+               </el-tooltip>
+               <el-tooltip content="统计" placement="top">
+                  <el-button link type="warning" icon="DataAnalysis" @click="handleStatistics(scope.row)" v-hasPermi="['tushare:downloadTask:query']"></el-button>
                </el-tooltip>
                <el-tooltip content="修改" placement="top">
                   <el-button link type="primary" icon="Edit" @click="handleUpdate(scope.row)" v-hasPermi="['tushare:downloadTask:edit']"></el-button>
@@ -135,6 +168,70 @@
          @pagination="getList"
       />
 
+      <!-- 任务统计对话框 -->
+      <el-dialog title="任务执行统计" v-model="statisticsOpen" width="800px" append-to-body>
+         <el-descriptions :column="2" border v-if="statisticsData">
+            <el-descriptions-item label="任务ID">{{ statisticsData.taskId }}</el-descriptions-item>
+            <el-descriptions-item label="任务名称">{{ statisticsData.taskName }}</el-descriptions-item>
+            <el-descriptions-item label="任务类型">
+               <el-tag :type="statisticsData.taskType === 'workflow' ? 'success' : 'info'">
+                  {{ statisticsData.taskType === 'workflow' ? '流程配置' : '单个接口' }}
+               </el-tag>
+            </el-descriptions-item>
+            <el-descriptions-item label="运行次数">{{ statisticsData.runCount }}</el-descriptions-item>
+            <el-descriptions-item label="成功次数">
+               <span style="color: #67c23a;">{{ statisticsData.successCount }}</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="失败次数">
+               <span style="color: #f56c6c;">{{ statisticsData.failCount }}</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="最后运行时间" :span="2">
+               {{ parseTime(statisticsData.lastRunTime) || '-' }}
+            </el-descriptions-item>
+         </el-descriptions>
+         
+         <el-divider>日志统计</el-divider>
+         <el-descriptions :column="2" border v-if="statisticsData.logStatistics">
+            <el-descriptions-item label="总日志数">{{ statisticsData.logStatistics.totalLogs }}</el-descriptions-item>
+            <el-descriptions-item label="成功日志数">
+               <span style="color: #67c23a;">{{ statisticsData.logStatistics.successLogs }}</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="失败日志数">
+               <span style="color: #f56c6c;">{{ statisticsData.logStatistics.failLogs }}</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="总记录数">{{ statisticsData.logStatistics.totalRecords }}</el-descriptions-item>
+            <el-descriptions-item label="平均耗时" :span="2">
+               {{ statisticsData.logStatistics.avgDuration }}秒
+            </el-descriptions-item>
+         </el-descriptions>
+         
+         <div v-if="statisticsData.taskType === 'workflow' && statisticsData.stepStatistics && statisticsData.stepStatistics.length > 0">
+            <el-divider>步骤统计</el-divider>
+            <el-table :data="statisticsData.stepStatistics" border>
+               <el-table-column label="步骤顺序" prop="stepOrder" width="100" align="center" />
+               <el-table-column label="步骤名称" prop="stepName" />
+               <el-table-column label="日志数" prop="logCount" width="100" align="center" />
+               <el-table-column label="成功数" prop="successCount" width="100" align="center">
+                  <template #default="scope">
+                     <span style="color: #67c23a;">{{ scope.row.successCount }}</span>
+                  </template>
+               </el-table-column>
+               <el-table-column label="失败数" prop="failCount" width="100" align="center">
+                  <template #default="scope">
+                     <span style="color: #f56c6c;">{{ scope.row.failCount }}</span>
+                  </template>
+               </el-table-column>
+               <el-table-column label="总记录数" prop="totalRecords" width="120" align="center" />
+            </el-table>
+         </div>
+         
+         <template #footer>
+            <div class="dialog-footer">
+               <el-button @click="statisticsOpen = false">关 闭</el-button>
+            </div>
+         </template>
+      </el-dialog>
+
       <!-- 添加或修改下载任务对话框 -->
       <el-dialog :title="title" v-model="open" width="900px" append-to-body>
          <el-form ref="taskRef" :model="form" :rules="rules" label-width="120px">
@@ -145,6 +242,14 @@
                   </el-form-item>
                </el-col>
                <el-col :span="24">
+                  <el-form-item label="执行方式">
+                     <el-radio-group v-model="executionMode" @change="handleExecutionModeChange">
+                        <el-radio value="single">单个接口</el-radio>
+                        <el-radio value="workflow">流程配置</el-radio>
+                     </el-radio-group>
+                  </el-form-item>
+               </el-col>
+               <el-col :span="24" v-if="executionMode === 'single'">
                   <el-form-item label="接口配置" prop="configId">
                      <el-select v-model="form.configId" placeholder="请选择接口配置" style="width: 100%" @change="handleConfigChange">
                         <el-option
@@ -154,6 +259,21 @@
                            :value="config.configId"
                         />
                      </el-select>
+                  </el-form-item>
+               </el-col>
+               <el-col :span="24" v-if="executionMode === 'workflow'">
+                  <el-form-item label="流程配置" prop="workflowId">
+                     <el-select v-model="form.workflowId" placeholder="请选择流程配置" style="width: 100%" @change="handleWorkflowChange">
+                        <el-option
+                           v-for="workflow in workflowConfigOptions"
+                           :key="workflow.workflowId"
+                           :label="workflow.workflowName + (workflow.workflowDesc ? ' - ' + workflow.workflowDesc : '')"
+                           :value="workflow.workflowId"
+                        />
+                     </el-select>
+                     <div style="color: #909399; font-size: 12px; margin-top: 5px;">
+                        选择流程配置后，将按流程步骤顺序执行多个接口
+                     </div>
                   </el-form-item>
                </el-col>
                <el-col :span="12">
@@ -233,9 +353,20 @@
                </el-col>
                <el-col :span="24" v-if="form.saveToDb === '1'">
                   <el-form-item label="数据表名" prop="dataTableName">
-                     <el-input v-model="form.dataTableName" placeholder="请输入数据存储表名（留空则使用默认表名：tushare_接口代码）" />
+                     <el-input 
+                        v-model="form.dataTableName" 
+                        :disabled="executionMode === 'workflow'"
+                        :placeholder="executionMode === 'workflow' 
+                           ? '流程配置模式下，每个步骤使用各自的接口代码作为表名' 
+                           : '请输入数据存储表名（留空则使用默认表名：tushare_接口代码）'" 
+                     />
                      <div style="color: #909399; font-size: 12px; margin-top: 5px;">
-                        留空则自动使用 tushare_接口代码 作为表名，表不存在时会自动创建
+                        <template v-if="executionMode === 'workflow'">
+                           流程配置模式下，每个步骤将使用各自的接口代码作为表名（如：tushare_api1, tushare_api2），表名输入框已禁用
+                        </template>
+                        <template v-else>
+                           留空则自动使用 tushare_接口代码 作为表名，表不存在时会自动创建
+                        </template>
                      </div>
                   </el-form-item>
                </el-col>
@@ -277,15 +408,20 @@
 
 <script setup name="DownloadTask">
 import { watch } from "vue"
-import { listDownloadTask, getDownloadTask, delDownloadTask, addDownloadTask, updateDownloadTask, changeDownloadTaskStatus, executeDownloadTask } from "@/api/tushare/downloadTask"
+import { listDownloadTask, getDownloadTask, delDownloadTask, addDownloadTask, updateDownloadTask, changeDownloadTaskStatus, executeDownloadTask, getDownloadTaskStatistics } from "@/api/tushare/downloadTask"
 import { listApiConfig } from "@/api/tushare/apiConfig"
+import { listWorkflowConfig } from "@/api/tushare/workflowConfig"
 
 const { proxy } = getCurrentInstance();
 const { sys_normal_disable } = proxy.useDict("sys_normal_disable");
 
 const taskList = ref([]);
 const apiConfigOptions = ref([]);
+const workflowConfigOptions = ref([]);
+const executionMode = ref('single'); // 'single' 或 'workflow'
 const open = ref(false);
+const statisticsOpen = ref(false);
+const statisticsData = ref(null);
 const loading = ref(true);
 const showSearch = ref(true);
 const ids = ref([]);
@@ -301,11 +437,24 @@ const data = reactive({
     pageSize: 10,
     taskName: undefined,
     configId: undefined,
+    workflowId: undefined,
+    taskType: undefined,
     status: undefined
   },
   rules: {
     taskName: [{ required: true, message: "任务名称不能为空", trigger: "blur" }],
-    configId: [{ required: true, message: "接口配置不能为空", trigger: "change" }],
+    workflowId: [
+      {
+        validator: (rule, value, callback) => {
+          if (executionMode.value === 'workflow' && !value) {
+            callback(new Error("流程配置不能为空"));
+          } else {
+            callback();
+          }
+        },
+        trigger: "change"
+      }
+    ],
     taskParams: [
       {
         validator: (rule, value, callback) => {
@@ -334,6 +483,12 @@ function getApiConfigName(configId) {
   return config ? config.apiName : configId;
 }
 
+/** 获取流程配置名称 */
+function getWorkflowConfigName(workflowId) {
+  const workflow = workflowConfigOptions.value.find(item => item.workflowId === workflowId);
+  return workflow ? workflow.workflowName : workflowId;
+}
+
 /** 查询下载任务列表 */
 function getList() {
   loading.value = true;
@@ -349,6 +504,29 @@ function getApiConfigList() {
   listApiConfig({ pageNum: 1, pageSize: 1000 }).then(response => {
     apiConfigOptions.value = response.rows || [];
   });
+}
+
+/** 查询流程配置列表 */
+function getWorkflowConfigList() {
+  listWorkflowConfig({ pageNum: 1, pageSize: 1000, status: '0' }).then(response => {
+    workflowConfigOptions.value = response.rows || [];
+  });
+}
+
+/** 执行方式改变 */
+function handleExecutionModeChange() {
+  if (executionMode.value === 'single') {
+    form.value.workflowId = undefined;
+  } else {
+    form.value.configId = undefined;
+    // 流程配置模式下，清空表名，让每个步骤使用各自的接口代码作为表名
+    form.value.dataTableName = undefined;
+  }
+}
+
+/** 流程配置改变 */
+function handleWorkflowChange() {
+  // 可以在这里添加一些逻辑
 }
 
 /** 接口配置改变时，自动填充数据表名 */
@@ -384,6 +562,7 @@ function reset() {
     taskId: undefined,
     taskName: undefined,
     configId: undefined,
+    workflowId: undefined,
     cronExpression: undefined,
     startDate: undefined,
     endDate: undefined,
@@ -395,6 +574,7 @@ function reset() {
     status: "0",
     remark: undefined
   };
+  executionMode.value = 'single'; // 重置执行方式为单个接口
   proxy.resetForm("taskRef");
 }
 
@@ -442,13 +622,45 @@ function handleUpdate(row) {
   const taskId = row.taskId || ids.value[0];
   getDownloadTask(taskId).then(response => {
     form.value = response.data;
+    // 根据 workflowId 或 taskType 设置执行方式
+    if (form.value.workflowId || form.value.taskType === 'workflow') {
+      executionMode.value = 'workflow';
+    } else {
+      executionMode.value = 'single';
+    }
     open.value = true;
     title.value = "修改下载任务";
   });
 }
 
+/** 统计按钮操作 */
+function handleStatistics(row) {
+  const taskId = row.taskId;
+  statisticsOpen.value = true;
+  statisticsData.value = null;
+  getDownloadTaskStatistics(taskId).then(response => {
+    statisticsData.value = response.data;
+  }).catch(() => {
+    proxy.$modal.msgError("获取统计信息失败");
+  });
+}
+
 /** 提交按钮 */
 function submitForm() {
+  // 在验证前，根据执行方式清理不需要的字段，避免验证错误
+  if (executionMode.value === 'single') {
+    form.value.workflowId = undefined;
+    form.value.taskType = 'single';
+  } else {
+    // 流程配置模式：确保 workflowId 有值
+    if (!form.value.workflowId) {
+      proxy.$modal.msgError("请选择流程配置");
+      return;
+    }
+    form.value.configId = undefined;
+    form.value.taskType = 'workflow';
+  }
+  
   proxy.$refs["taskRef"].validate(valid => {
     if (valid) {
       if (form.value.taskId != undefined) {
@@ -492,4 +704,5 @@ function handleDelete(row) {
 
 getList();
 getApiConfigList();
+getWorkflowConfigList();
 </script>

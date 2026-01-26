@@ -54,12 +54,8 @@ class PageUtil:
         if is_page:
             total = (await db.execute(select(func.count('*')).select_from(query.subquery()))).scalar()
             query_result = await db.execute(query.offset((page_num - 1) * page_size).limit(page_size))
-            paginated_data: list[Row] = []
-            for row in query_result:
-                if row and len(row) == 1:
-                    paginated_data.append(row[0])
-                else:
-                    paginated_data.append(row)
+            # 使用 scalars() 获取标量结果（ORM 对象），而不是 Row 对象
+            paginated_data = query_result.scalars().all()
             has_next = math.ceil(total / page_size) > page_num
             result = PageModel[Any](
                 rows=CamelCaseUtil.transform_result(paginated_data),
@@ -70,12 +66,8 @@ class PageUtil:
             )
         else:
             query_result = await db.execute(query)
-            no_paginated_data: list[Row] = []
-            for row in query_result:
-                if row and len(row) == 1:
-                    no_paginated_data.append(row[0])
-                else:
-                    no_paginated_data.append(row)
+            # 使用 scalars() 获取标量结果（ORM 对象），而不是 Row 对象
+            no_paginated_data = query_result.scalars().all()
             result = CamelCaseUtil.transform_result(no_paginated_data)
 
         return result

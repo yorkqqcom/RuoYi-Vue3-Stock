@@ -10,19 +10,31 @@ from module_tushare.dao.tushare_dao import (
     TushareApiConfigDao,
     TushareDownloadLogDao,
     TushareDownloadTaskDao,
+    TushareWorkflowConfigDao,
+    TushareWorkflowStepDao,
 )
 from module_tushare.entity.do.tushare_do import TushareDownloadLog
 from module_tushare.entity.vo.tushare_vo import (
+    BatchSaveWorkflowStepModel,
     DeleteTushareApiConfigModel,
     DeleteTushareDownloadLogModel,
     DeleteTushareDownloadTaskModel,
+    DeleteTushareWorkflowConfigModel,
+    DeleteTushareWorkflowStepModel,
     EditTushareApiConfigModel,
     EditTushareDownloadTaskModel,
+    EditTushareWorkflowConfigModel,
+    EditTushareWorkflowStepModel,
     TushareApiConfigModel,
     TushareApiConfigPageQueryModel,
     TushareDownloadLogPageQueryModel,
     TushareDownloadTaskModel,
     TushareDownloadTaskPageQueryModel,
+    TushareWorkflowConfigModel,
+    TushareWorkflowConfigPageQueryModel,
+    TushareWorkflowConfigWithStepsModel,
+    TushareWorkflowStepModel,
+    TushareWorkflowStepPageQueryModel,
 )
 from utils.common_util import CamelCaseUtil
 from utils.excel_util import ExcelUtil
@@ -226,6 +238,18 @@ class TushareDownloadTaskService:
         """
         task_list_result = await TushareDownloadTaskDao.get_task_list(query_db, query_object, is_page)
 
+        # 为每个任务添加任务类型信息
+        if isinstance(task_list_result, dict) and 'rows' in task_list_result:
+            # 分页结果
+            for task in task_list_result['rows']:
+                if isinstance(task, dict):
+                    task['task_type'] = 'workflow' if task.get('workflow_id') else 'single'
+        elif isinstance(task_list_result, list):
+            # 列表结果
+            for task in task_list_result:
+                if isinstance(task, dict):
+                    task['task_type'] = 'workflow' if task.get('workflow_id') else 'single'
+
         return task_list_result
 
     @classmethod
@@ -259,16 +283,41 @@ class TushareDownloadTaskService:
         if not await cls.check_task_unique_services(query_db, page_object):
             raise ServiceException(message=f'新增下载任务{page_object.task_name}失败，任务名称已存在')
         try:
-            # 处理cron_expression：空字符串转换为None，使用by_alias=False确保使用snake_case键名
-            task_dict = page_object.model_dump(exclude={'task_id'}, by_alias=False)
-            if 'cron_expression' in task_dict:
-                task_dict['cron_expression'] = (
-                    task_dict['cron_expression'].strip()
-                    if task_dict['cron_expression'] and task_dict['cron_expression'].strip()
+            # 验证必要字段
+            if not page_object.task_name or (isinstance(page_object.task_name, str) and not page_object.task_name.strip()):
+                raise ServiceException(message='任务名称不能为空')
+            
+            # 处理cron_expression：空字符串转换为None
+            if page_object.cron_expression:
+                page_object.cron_expression = (
+                    page_object.cron_expression.strip()
+                    if page_object.cron_expression.strip()
                     else None
                 )
-            add_task = await TushareDownloadTaskDao.add_task_dao(query_db, TushareDownloadTaskModel(**task_dict))
+            else:
+                page_object.cron_expression = None
+            
+            logger.info(f'[新增任务] 处理后的task_name: {page_object.task_name}, 类型: {type(page_object.task_name)}')
+            
+            # 再次确保 task_name 不为空
+            if not page_object.task_name or (isinstance(page_object.task_name, str) and not page_object.task_name.strip()):
+                raise ServiceException(message='任务名称不能为空')
+            
+            # 直接使用原始模型对象，避免重新创建导致字段丢失
+            # 使用DAO层方法添加任务
+            add_task = await TushareDownloadTaskDao.add_task_dao(query_db, page_object)
             await query_db.commit()
+            
+            # 如果任务配置了cron表达式且状态为启用，注册到调度器
+            # 从原始 page_object 中获取值，避免访问 ORM 对象的延迟加载属性导致 greenlet 错误
+            cron_expr = page_object.cron_expression
+            task_status = page_object.status
+            if cron_expr and cron_expr.strip() and task_status == '0':
+                # 延迟导入，避免循环导入
+                from module_tushare.service.tushare_scheduler_service import TushareSchedulerService
+                # 直接使用原始的 page_object，确保所有字段都正确
+                TushareSchedulerService.register_task_scheduler(page_object)
+            
             result = {'is_success': True, 'message': '新增成功'}
         except Exception as e:
             await query_db.rollback()
@@ -333,6 +382,8 @@ class TushareDownloadTaskService:
             logger.error(f'[编辑任务] 任务不存在，task_id: {page_object.task_id}')
             raise ServiceException(message='下载任务不存在')
         
+        # 刷新对象以确保所有属性都已加载，避免延迟加载导致的 greenlet 错误
+        await query_db.refresh(old_task)
         logger.info(f'[编辑任务] 原始任务数据: task_name={old_task.task_name}, cron_expression={old_task.cron_expression}')
         
         if page_object.type != 'status':
@@ -378,7 +429,17 @@ class TushareDownloadTaskService:
             # 验证更新结果
             updated_task = await TushareDownloadTaskDao.get_task_detail_by_id(query_db, page_object.task_id)
             if updated_task:
+                # 刷新对象以确保所有属性都已加载，避免延迟加载导致的 greenlet 错误
+                await query_db.refresh(updated_task)
                 logger.info(f'[编辑任务] 更新后的任务数据: task_name={updated_task.task_name}, cron_expression={updated_task.cron_expression}')
+                
+                # 更新调度器中的任务
+                # 延迟导入，避免循环导入
+                from module_tushare.service.tushare_scheduler_service import TushareSchedulerService
+                # 使用刷新后的对象创建模型，确保所有属性都已加载
+                updated_task_model = TushareDownloadTaskModel(**CamelCaseUtil.transform_result(updated_task))
+                old_task_model = TushareDownloadTaskModel(**CamelCaseUtil.transform_result(old_task))
+                TushareSchedulerService.update_task_scheduler(updated_task_model, old_task_model)
             else:
                 logger.warning(f'[编辑任务] 更新后无法获取任务数据，task_id: {page_object.task_id}')
             
@@ -403,6 +464,12 @@ class TushareDownloadTaskService:
         """
         task_ids = [int(task_id) for task_id in page_object.task_ids.split(',')]
         try:
+            # 在删除前，先从调度器移除任务
+            # 延迟导入，避免循环导入
+            from module_tushare.service.tushare_scheduler_service import TushareSchedulerService
+            for task_id in task_ids:
+                TushareSchedulerService.remove_task_scheduler(task_id)
+            
             await TushareDownloadTaskDao.delete_task_dao(query_db, task_ids)
             await query_db.commit()
             result = {'is_success': True, 'message': '删除成功'}
@@ -421,11 +488,40 @@ class TushareDownloadTaskService:
         :param task_id: 下载任务id
         :return: 下载任务详细信息对象
         """
+        from module_tushare.entity.vo.tushare_vo import TushareDownloadTaskDetailModel
+        
         task = await TushareDownloadTaskDao.get_task_detail_by_id(query_db, task_id)
-        result = (
-            TushareDownloadTaskModel(**CamelCaseUtil.transform_result(task)) if task else TushareDownloadTaskModel()
-        )
-
+        if not task:
+            return TushareDownloadTaskModel()
+        
+        task_dict = CamelCaseUtil.transform_result(task)
+        
+        # 判断任务类型并获取关联信息
+        if task.workflow_id:
+            # 流程配置任务
+            workflow = await TushareWorkflowConfigDao.get_workflow_detail_by_id(query_db, task.workflow_id)
+            steps = await TushareWorkflowStepDao.get_steps_by_workflow_id(query_db, task.workflow_id)
+            
+            task_dict['task_type'] = 'workflow'
+            if workflow:
+                task_dict['workflow_name'] = workflow.workflow_name
+                task_dict['workflow_desc'] = workflow.workflow_desc
+            task_dict['step_count'] = len(steps) if steps else 0
+            if steps:
+                from module_tushare.entity.vo.tushare_vo import TushareWorkflowStepModel
+                task_dict['steps'] = [
+                    TushareWorkflowStepModel(**CamelCaseUtil.transform_result(step)).model_dump()
+                    for step in steps
+                ]
+        else:
+            # 单个接口任务
+            config = await TushareApiConfigDao.get_config_detail_by_id(query_db, task.config_id)
+            task_dict['task_type'] = 'single'
+            if config:
+                task_dict['api_name'] = config.api_name
+                task_dict['api_code'] = config.api_code
+        
+        result = TushareDownloadTaskDetailModel(**task_dict)
         return result
 
     @classmethod
@@ -475,6 +571,96 @@ class TushareDownloadTaskService:
 
         return CrudResponseModel(**result)
 
+    @classmethod
+    async def get_task_statistics_services(
+        cls, query_db: AsyncSession, task_id: int
+    ) -> dict[str, Any]:
+        """
+        获取任务执行统计信息service（区分单个接口和流程配置）
+
+        :param query_db: orm对象
+        :param task_id: 任务ID
+        :return: 任务执行统计信息
+        """
+        from sqlalchemy import func, select, Integer, cast
+        from module_tushare.entity.do.tushare_do import TushareDownloadLog
+        
+        # 获取任务信息
+        task = await TushareDownloadTaskDao.get_task_detail_by_id(query_db, task_id)
+        if not task:
+            raise ServiceException(message='任务不存在')
+        
+        # 判断任务类型
+        task_type = 'workflow' if task.workflow_id else 'single'
+        
+        # 获取日志统计
+        log_stats_query = (
+            select(
+                func.count(TushareDownloadLog.log_id).label('total_count'),
+                func.sum(cast(TushareDownloadLog.status == '0', Integer)).label('success_count'),
+                func.sum(cast(TushareDownloadLog.status == '1', Integer)).label('fail_count'),
+                func.sum(TushareDownloadLog.record_count).label('total_records'),
+                func.avg(TushareDownloadLog.duration).label('avg_duration'),
+            )
+            .where(TushareDownloadLog.task_id == task_id)
+        )
+        
+        log_stats_result = await query_db.execute(log_stats_query)
+        log_stats = log_stats_result.first()
+        
+        statistics = {
+            'task_id': task_id,
+            'task_name': task.task_name,
+            'task_type': task_type,
+            'run_count': task.run_count or 0,
+            'success_count': task.success_count or 0,
+            'fail_count': task.fail_count or 0,
+            'last_run_time': task.last_run_time.isoformat() if task.last_run_time else None,
+            'log_statistics': {
+                'total_logs': log_stats.total_count or 0,
+                'success_logs': log_stats.success_count or 0,
+                'fail_logs': log_stats.fail_count or 0,
+                'total_records': log_stats.total_records or 0,
+                'avg_duration': round(log_stats.avg_duration, 2) if log_stats.avg_duration else 0,
+            },
+        }
+        
+        # 如果是流程配置任务，获取步骤统计
+        if task_type == 'workflow' and task.workflow_id:
+            from module_tushare.dao.tushare_dao import TushareWorkflowStepDao
+            steps = await TushareWorkflowStepDao.get_steps_by_workflow_id(query_db, task.workflow_id)
+            
+            step_statistics = []
+            for step in steps:
+                step_log_query = (
+                    select(
+                        func.count(TushareDownloadLog.log_id).label('count'),
+                        func.sum(cast(TushareDownloadLog.status == '0', Integer)).label('success'),
+                        func.sum(cast(TushareDownloadLog.status == '1', Integer)).label('fail'),
+                        func.sum(TushareDownloadLog.record_count).label('records'),
+                    )
+                    .where(
+                        TushareDownloadLog.task_id == task_id,
+                        TushareDownloadLog.task_name.like(f'%[{step.step_name}]%')
+                    )
+                )
+                step_log_result = await query_db.execute(step_log_query)
+                step_log = step_log_result.first()
+                
+                step_statistics.append({
+                    'step_id': step.step_id,
+                    'step_name': step.step_name,
+                    'step_order': step.step_order,
+                    'log_count': step_log.count or 0,
+                    'success_count': step_log.success or 0,
+                    'fail_count': step_log.fail or 0,
+                    'total_records': step_log.records or 0,
+                })
+            
+            statistics['step_statistics'] = step_statistics
+        
+        return statistics
+
 
 class TushareDownloadLogService:
     """
@@ -494,6 +680,28 @@ class TushareDownloadLogService:
         :return: 下载日志列表信息对象
         """
         log_list_result = await TushareDownloadLogDao.get_log_list(query_db, query_object, is_page)
+
+        # 为每个日志添加任务类型信息（通过task_name判断：包含[的是流程配置任务）
+        if isinstance(log_list_result, dict) and 'rows' in log_list_result:
+            # 分页结果
+            for log in log_list_result['rows']:
+                if isinstance(log, dict):
+                    task_name = log.get('task_name', '')
+                    log['task_type'] = 'workflow' if '[' in task_name else 'single'
+                    # 如果是流程配置任务，提取步骤名称
+                    if '[' in task_name and ']' in task_name:
+                        step_name = task_name[task_name.index('[') + 1:task_name.index(']')]
+                        log['step_name'] = step_name
+        elif isinstance(log_list_result, list):
+            # 列表结果
+            for log in log_list_result:
+                if isinstance(log, dict):
+                    task_name = log.get('task_name', '')
+                    log['task_type'] = 'workflow' if '[' in task_name else 'single'
+                    # 如果是流程配置任务，提取步骤名称
+                    if '[' in task_name and ']' in task_name:
+                        step_name = task_name[task_name.index('[') + 1:task_name.index(']')]
+                        log['step_name'] = step_name
 
         return log_list_result
 
@@ -550,6 +758,304 @@ class TushareDownloadLogService:
             await TushareDownloadLogDao.clear_log_dao(query_db)
             await query_db.commit()
             result = {'is_success': True, 'message': '清空成功'}
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+        return CrudResponseModel(**result)
+
+
+class TushareWorkflowConfigService:
+    """
+    Tushare流程配置管理模块服务层
+    """
+
+    @classmethod
+    async def get_workflow_list_services(
+        cls, query_db: AsyncSession, query_object: TushareWorkflowConfigPageQueryModel, is_page: bool = False
+    ) -> Any:
+        """
+        获取流程配置列表信息service
+
+        :param query_db: orm对象
+        :param query_object: 查询参数对象
+        :param is_page: 是否开启分页
+        :return: 流程配置列表信息对象
+        """
+        workflow_list_result = await TushareWorkflowConfigDao.get_workflow_list(query_db, query_object, is_page)
+
+        return workflow_list_result
+
+    @classmethod
+    async def check_workflow_unique_services(
+        cls, query_db: AsyncSession, page_object: TushareWorkflowConfigModel
+    ) -> bool:
+        """
+        校验流程配置是否存在service
+
+        :param query_db: orm对象
+        :param page_object: 流程配置对象
+        :return: 校验结果
+        """
+        workflow_id = -1 if page_object.workflow_id is None else page_object.workflow_id
+        workflow = await TushareWorkflowConfigDao.get_workflow_detail_by_info(query_db, page_object)
+        if workflow and workflow.workflow_id != workflow_id:
+            return CommonConstant.NOT_UNIQUE
+        return CommonConstant.UNIQUE
+
+    @classmethod
+    async def add_workflow_services(
+        cls, query_db: AsyncSession, page_object: TushareWorkflowConfigModel
+    ) -> CrudResponseModel:
+        """
+        新增流程配置信息service
+
+        :param query_db: orm对象
+        :param page_object: 新增流程配置对象
+        :return: 新增流程配置校验结果
+        """
+        if not await cls.check_workflow_unique_services(query_db, page_object):
+            raise ServiceException(message=f'新增流程配置{page_object.workflow_name}失败，流程名称已存在')
+        try:
+            add_workflow = await TushareWorkflowConfigDao.add_workflow_dao(query_db, page_object)
+            await query_db.commit()
+            result = {'is_success': True, 'message': '新增成功'}
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+        return CrudResponseModel(**result)
+
+    @classmethod
+    def _deal_edit_workflow(
+        cls, page_object: EditTushareWorkflowConfigModel, edit_workflow: dict[str, Any]
+    ) -> None:
+        """
+        处理编辑流程配置字典
+
+        :param page_object: 编辑流程配置对象
+        :param edit_workflow: 编辑流程配置字典
+        """
+        if page_object.workflow_name is not None:
+            edit_workflow['workflow_name'] = page_object.workflow_name
+        if page_object.workflow_desc is not None:
+            edit_workflow['workflow_desc'] = page_object.workflow_desc
+        if page_object.status is not None:
+            edit_workflow['status'] = page_object.status
+        if page_object.remark is not None:
+            edit_workflow['remark'] = page_object.remark
+
+    @classmethod
+    async def edit_workflow_services(
+        cls, query_db: AsyncSession, page_object: EditTushareWorkflowConfigModel
+    ) -> CrudResponseModel:
+        """
+        编辑流程配置信息service
+
+        :param query_db: orm对象
+        :param page_object: 编辑流程配置对象
+        :return: 编辑流程配置校验结果
+        """
+        old_workflow = await TushareWorkflowConfigDao.get_workflow_detail_by_id(query_db, page_object.workflow_id)
+        if not old_workflow:
+            raise ServiceException(message='流程配置不存在')
+
+        if page_object.workflow_name and page_object.workflow_name != old_workflow.workflow_name:
+            check_workflow = TushareWorkflowConfigModel(
+                workflowId=page_object.workflow_id, workflowName=page_object.workflow_name
+            )
+            if not await cls.check_workflow_unique_services(query_db, check_workflow):
+                raise ServiceException(message=f'编辑流程配置{page_object.workflow_name}失败，流程名称已存在')
+
+        try:
+            edit_workflow_dict: dict[str, Any] = {}
+            cls._deal_edit_workflow(page_object, edit_workflow_dict)
+            result_id = await TushareWorkflowConfigDao.edit_workflow_dao(
+                query_db, TushareWorkflowConfigModel(**{**page_object.model_dump(), **edit_workflow_dict})
+            )
+            await query_db.commit()
+            result = {'is_success': True, 'message': '编辑成功'}
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+        return CrudResponseModel(**result)
+
+    @classmethod
+    async def delete_workflow_services(
+        cls, query_db: AsyncSession, page_object: DeleteTushareWorkflowConfigModel
+    ) -> CrudResponseModel:
+        """
+        删除流程配置信息service
+
+        :param query_db: orm对象
+        :param page_object: 删除流程配置对象
+        :return: 删除流程配置校验结果
+        """
+        workflow_ids = [int(workflow_id) for workflow_id in page_object.workflow_ids.split(',')]
+        try:
+            # 先删除关联的步骤
+            for workflow_id in workflow_ids:
+                await TushareWorkflowStepDao.delete_steps_by_workflow_id(query_db, workflow_id)
+            # 再删除流程配置
+            await TushareWorkflowConfigDao.delete_workflow_dao(query_db, workflow_ids)
+            await query_db.commit()
+            result = {'is_success': True, 'message': '删除成功'}
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+        return CrudResponseModel(**result)
+
+    @classmethod
+    async def workflow_detail_services(
+        cls, query_db: AsyncSession, workflow_id: int
+    ) -> TushareWorkflowConfigWithStepsModel:
+        """
+        获取流程配置详细信息service（包含步骤列表）
+
+        :param query_db: orm对象
+        :param workflow_id: 流程配置id
+        :return: 流程配置详细信息对象
+        """
+        workflow = await TushareWorkflowConfigDao.get_workflow_detail_by_id(query_db, workflow_id)
+        if not workflow:
+            return TushareWorkflowConfigWithStepsModel()
+
+        # 获取步骤列表
+        steps = await TushareWorkflowStepDao.get_steps_by_workflow_id(query_db, workflow_id)
+        step_models = [
+            TushareWorkflowStepModel(**CamelCaseUtil.transform_result(step)) for step in steps
+        ]
+
+        workflow_model = TushareWorkflowConfigModel(**CamelCaseUtil.transform_result(workflow))
+        return TushareWorkflowConfigWithStepsModel(**workflow_model.model_dump(), steps=step_models)
+
+
+class TushareWorkflowStepService:
+    """
+    Tushare流程步骤管理模块服务层
+    """
+
+    @classmethod
+    async def get_step_list_services(
+        cls, query_db: AsyncSession, query_object: TushareWorkflowStepPageQueryModel, is_page: bool = False
+    ) -> Any:
+        """
+        获取流程步骤列表信息service
+
+        :param query_db: orm对象
+        :param query_object: 查询参数对象
+        :param is_page: 是否开启分页
+        :return: 流程步骤列表信息对象
+        """
+        step_list_result = await TushareWorkflowStepDao.get_step_list(query_db, query_object, is_page)
+
+        return step_list_result
+
+    @classmethod
+    async def add_step_services(
+        cls, query_db: AsyncSession, page_object: TushareWorkflowStepModel
+    ) -> CrudResponseModel:
+        """
+        新增流程步骤信息service
+
+        :param query_db: orm对象
+        :param page_object: 新增流程步骤对象
+        :return: 新增流程步骤校验结果
+        """
+        try:
+            add_step = await TushareWorkflowStepDao.add_step_dao(query_db, page_object)
+            await query_db.commit()
+            result = {'is_success': True, 'message': '新增成功'}
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+        return CrudResponseModel(**result)
+
+    @classmethod
+    async def edit_step_services(
+        cls, query_db: AsyncSession, page_object: EditTushareWorkflowStepModel
+    ) -> CrudResponseModel:
+        """
+        编辑流程步骤信息service
+
+        :param query_db: orm对象
+        :param page_object: 编辑流程步骤对象
+        :return: 编辑流程步骤校验结果
+        """
+        try:
+            result_id = await TushareWorkflowStepDao.edit_step_dao(query_db, page_object)
+            await query_db.commit()
+            result = {'is_success': True, 'message': '编辑成功'}
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+        return CrudResponseModel(**result)
+
+    @classmethod
+    async def delete_step_services(
+        cls, query_db: AsyncSession, page_object: DeleteTushareWorkflowStepModel
+    ) -> CrudResponseModel:
+        """
+        删除流程步骤信息service
+
+        :param query_db: orm对象
+        :param page_object: 删除流程步骤对象
+        :return: 删除流程步骤校验结果
+        """
+        step_ids = [int(step_id) for step_id in page_object.step_ids.split(',')]
+        try:
+            await TushareWorkflowStepDao.delete_step_dao(query_db, step_ids)
+            await query_db.commit()
+            result = {'is_success': True, 'message': '删除成功'}
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+        return CrudResponseModel(**result)
+
+    @classmethod
+    async def batch_save_step_services(
+        cls, query_db: AsyncSession, batch_data: BatchSaveWorkflowStepModel, user_name: str
+    ) -> CrudResponseModel:
+        """
+        批量保存流程步骤信息service（创建、更新、删除）
+
+        :param query_db: orm对象
+        :param batch_data: 批量数据对象，包含 create, update, delete 三个列表
+        :param user_name: 用户名
+        :return: 批量保存结果
+        """
+        from datetime import datetime
+        
+        try:
+            create_list = batch_data.create or []
+            update_list = batch_data.update or []
+            delete_ids = batch_data.delete or []
+            
+            # 删除步骤
+            if delete_ids and len(delete_ids) > 0:
+                await TushareWorkflowStepDao.delete_step_dao(query_db, delete_ids)
+            
+            # 创建步骤
+            for step_model in create_list:
+                step_model.create_by = user_name
+                step_model.create_time = datetime.now()
+                step_model.update_by = user_name
+                step_model.update_time = datetime.now()
+                await TushareWorkflowStepDao.add_step_dao(query_db, step_model)
+            
+            # 更新步骤
+            for step_model in update_list:
+                step_model.update_by = user_name
+                step_model.update_time = datetime.now()
+                await TushareWorkflowStepDao.edit_step_dao(query_db, step_model)
+            
+            await query_db.commit()
+            result = {'is_success': True, 'message': '批量保存成功'}
         except Exception as e:
             await query_db.rollback()
             raise e

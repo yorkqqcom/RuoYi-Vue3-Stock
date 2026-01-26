@@ -16,6 +16,8 @@ from module_tushare.dao.tushare_dao import (
     TushareDataDao,
     TushareDownloadLogDao,
     TushareDownloadTaskDao,
+    TushareWorkflowConfigDao,
+    TushareWorkflowStepDao,
 )
 from module_tushare.entity.do.tushare_do import TushareData, TushareDownloadLog
 from module_tushare.entity.vo.tushare_vo import TushareDownloadTaskModel
@@ -223,6 +225,431 @@ async def ensure_table_exists(session: AsyncSession, table_name: str, api_code: 
         logger.info(f'已创建数据表: {table_name}，包含 {len(df.columns)} 个数据列')
 
 
+async def execute_single_api(session: AsyncSession, task, download_date: str) -> None:
+    """
+    执行单个接口下载
+
+    :param session: 数据库会话
+    :param task: 任务对象
+    :param download_date: 下载日期
+    :return: None
+    """
+    start_time = datetime.now()
+    config = await TushareApiConfigDao.get_config_detail_by_id(session, task.config_id)
+    if not config:
+        logger.error(f'接口配置ID {task.config_id} 不存在')
+        return
+
+    if config.status != '0':
+        logger.warning(f'接口配置 {config.api_name} 已停用')
+        return
+
+    # 解析参数
+    api_params = {}
+    if config.api_params:
+        api_params = json.loads(config.api_params)
+
+    # 任务参数覆盖接口默认参数
+    if task.task_params:
+        task_params = json.loads(task.task_params)
+        api_params.update(task_params)
+
+    # 如果任务指定了日期范围，使用任务日期
+    if task.start_date and task.end_date:
+        api_params['start_date'] = task.start_date
+        api_params['end_date'] = task.end_date
+    elif download_date:
+        # 如果没有指定日期范围，使用单日期
+        api_params['trade_date'] = download_date
+
+    # 调用tushare接口
+    logger.info(f'开始下载任务: {task.task_name}, 接口: {config.api_code}, 参数: {api_params}')
+
+    # 获取tushare pro接口
+    ts_token = TushareConfig.tushare_token or os.getenv('TUSHARE_TOKEN', '')
+    if not ts_token:
+        raise ValueError(
+            'TUSHARE_TOKEN未设置，请在.env.dev文件中配置TUSHARE_TOKEN环境变量。'
+            '例如：TUSHARE_TOKEN=your_tushare_token_here'
+        )
+
+    pro = ts.pro_api(ts_token)
+
+    # 动态调用接口
+    api_func = getattr(pro, config.api_code, None)
+    if not api_func:
+        raise ValueError(f'接口 {config.api_code} 不存在')
+
+    # 调用接口获取数据
+    try:
+        df = api_func(**api_params)
+    except Exception as api_error:
+        error_detail = f'Tushare接口调用失败: {str(api_error)}\n参数: {api_params}'
+        logger.exception(f'任务 {task.task_name} Tushare接口调用异常: {error_detail}')
+        raise Exception(error_detail) from api_error
+
+    if df is None or df.empty:
+        logger.warning(f'任务 {task.task_name} 下载数据为空')
+        record_count = 0
+        file_path = None
+    else:
+        record_count = len(df)
+
+        # 如果指定了数据字段，只保留指定字段
+        if config.data_fields:
+            data_fields = json.loads(config.data_fields)
+            if isinstance(data_fields, list):
+                available_fields = [field for field in data_fields if field in df.columns]
+                if available_fields:
+                    df = df[available_fields]
+
+        # 保存到数据库（如果启用）
+        if task.save_to_db == '1':
+            try:
+                table_name = task.data_table_name
+                if not table_name or table_name.strip() == '':
+                    table_name = f'tushare_{config.api_code}'
+                
+                await ensure_table_exists(session, table_name, config.api_code, df)
+                await TushareDataDao.add_dataframe_to_table_dao(session, table_name, df, task.task_id, config.config_id, config.api_code, download_date)
+                logger.info(f'已保存 {len(df)} 条数据到数据库表 {table_name}')
+            except Exception as db_error:
+                error_detail = f'保存数据到数据库失败: {str(db_error)}'
+                logger.exception(f'任务 {task.task_name} 保存数据到数据库异常: {error_detail}')
+                raise Exception(error_detail) from db_error
+
+        # 保存到文件（如果配置了保存路径）
+        file_path = None
+        if task.save_path:
+            try:
+                save_path = task.save_path
+                os.makedirs(save_path, exist_ok=True)
+                file_name = f"{config.api_code}_{download_date}_{datetime.now().strftime('%H%M%S')}"
+                save_format = task.save_format or 'csv'
+
+                if save_format == 'csv':
+                    file_path = os.path.join(save_path, f'{file_name}.csv')
+                    df.to_csv(file_path, index=False, encoding='utf-8-sig')
+                elif save_format == 'excel':
+                    file_path = os.path.join(save_path, f'{file_name}.xlsx')
+                    df.to_excel(file_path, index=False, engine='openpyxl')
+                elif save_format == 'json':
+                    file_path = os.path.join(save_path, f'{file_name}.json')
+                    df.to_json(file_path, orient='records', force_ascii=False, indent=2)
+                else:
+                    file_path = os.path.join(save_path, f'{file_name}.csv')
+                    df.to_csv(file_path, index=False, encoding='utf-8-sig')
+
+                logger.info(f'数据已保存到文件: {file_path}')
+            except Exception as file_error:
+                error_detail = f'保存数据到文件失败: {str(file_error)}'
+                logger.exception(f'任务 {task.task_name} 保存数据到文件异常: {error_detail}')
+                raise Exception(error_detail) from file_error
+
+    # 计算执行时长
+    duration = int((datetime.now() - start_time).total_seconds())
+
+    # 创建下载日志
+    log = TushareDownloadLog(
+        task_id=task.task_id,
+        task_name=task.task_name,
+        config_id=config.config_id,
+        api_name=config.api_name,
+        download_date=download_date,
+        record_count=record_count,
+        file_path=file_path,
+        status='0',
+        duration=duration,
+        create_time=datetime.now(),
+    )
+
+    await TushareDownloadLogDao.add_log_dao(session, log)
+    
+    # 更新任务统计（使用字典方式，避免被排除列表影响）
+    update_stats_dict = {
+        'run_count': (task.run_count or 0) + 1,
+        'success_count': (task.success_count or 0) + 1,
+        'last_run_time': datetime.now()
+    }
+    await TushareDownloadTaskDao.edit_task_dao(session, task.task_id, update_stats_dict)
+    
+    await session.commit()
+    logger.info(f'任务 {task.task_name} 执行成功，记录数: {record_count}, 耗时: {duration}秒')
+
+
+async def execute_workflow(session: AsyncSession, task, download_date: str) -> None:
+    """
+    执行流程配置，串联多个接口
+
+    :param session: 数据库会话
+    :param task: 任务对象
+    :param download_date: 下载日期
+    :return: None
+    """
+    start_time = datetime.now()
+    
+    # 保存任务名称，避免在 commit 后访问过期属性导致延迟加载错误
+    task_name = task.task_name
+    
+    # 获取流程配置
+    workflow = await TushareWorkflowConfigDao.get_workflow_detail_by_id(session, task.workflow_id)
+    if not workflow:
+        logger.error(f'流程配置ID {task.workflow_id} 不存在')
+        return
+
+    if workflow.status != '0':
+        logger.warning(f'流程配置 {workflow.workflow_name} 已停用')
+        return
+
+    # 获取流程步骤（按顺序）
+    steps = await TushareWorkflowStepDao.get_steps_by_workflow_id(session, task.workflow_id)
+    if not steps:
+        logger.warning(f'流程配置 {workflow.workflow_name} 没有配置步骤')
+        return
+
+    # 获取tushare pro接口
+    ts_token = TushareConfig.tushare_token or os.getenv('TUSHARE_TOKEN', '')
+    if not ts_token:
+        raise ValueError(
+            'TUSHARE_TOKEN未设置，请在.env.dev文件中配置TUSHARE_TOKEN环境变量。'
+            '例如：TUSHARE_TOKEN=your_tushare_token_here'
+        )
+    pro = ts.pro_api(ts_token)
+
+    # 用于存储前一步的结果数据，供后续步骤使用
+    previous_results: dict[str, Any] = {}
+    total_record_count = 0
+
+    # 按顺序执行每个步骤
+    for step in steps:
+        if step.status != '0':
+            logger.warning(f'步骤 {step.step_name} 已停用，跳过')
+            continue
+
+        # 跳过开始和结束节点（这些节点不需要接口配置）
+        node_type = getattr(step, 'node_type', 'task')
+        if node_type in ['start', 'end']:
+            logger.info(f'步骤 {step.step_name} 是{node_type}节点，跳过执行')
+            continue
+
+        step_start_time = datetime.now()
+        logger.info(f'开始执行步骤: {step.step_name} (顺序: {step.step_order})')
+
+        # 获取接口配置
+        config = await TushareApiConfigDao.get_config_detail_by_id(session, step.config_id)
+        if not config:
+            logger.error(f'步骤 {step.step_name} 的接口配置ID {step.config_id} 不存在')
+            continue
+
+        if config.status != '0':
+            logger.warning(f'步骤 {step.step_name} 的接口配置 {config.api_name} 已停用')
+            continue
+
+        # 解析步骤参数（可以从前一步获取数据）
+        api_params = {}
+        if config.api_params:
+            api_params = json.loads(config.api_params)
+
+        # 步骤参数覆盖接口默认参数
+        if step.step_params:
+            step_params = json.loads(step.step_params)
+            # 支持从前一步结果中获取参数值
+            for key, value in step_params.items():
+                if isinstance(value, str) and value.startswith('${') and value.endswith('}'):
+                    # 支持 ${previous_step.field} 格式，从前一步结果中获取
+                    expr = value[2:-1]
+                    if '.' in expr:
+                        step_name, field = expr.split('.', 1)
+                        if step_name in previous_results:
+                            api_params[key] = previous_results[step_name].get(field)
+                        else:
+                            api_params[key] = value
+                    else:
+                        api_params[key] = previous_results.get(expr, value)
+                else:
+                    api_params[key] = value
+
+        # 任务参数覆盖步骤参数
+        if task.task_params:
+            task_params = json.loads(task.task_params)
+            api_params.update(task_params)
+
+        # 如果任务指定了日期范围，使用任务日期
+        if task.start_date and task.end_date:
+            api_params['start_date'] = task.start_date
+            api_params['end_date'] = task.end_date
+        elif download_date:
+            api_params['trade_date'] = download_date
+
+        # 检查执行条件（可选）
+        if step.condition_expr:
+            condition = json.loads(step.condition_expr)
+            # 简单的条件判断逻辑（可以根据需要扩展）
+            should_execute = True
+            if 'field' in condition and 'value' in condition:
+                field = condition['field']
+                expected_value = condition['value']
+                if field in previous_results:
+                    actual_value = previous_results[field]
+                    if condition.get('operator') == 'eq':
+                        should_execute = actual_value == expected_value
+                    elif condition.get('operator') == 'ne':
+                        should_execute = actual_value != expected_value
+                    # 可以扩展更多条件操作符
+            if not should_execute:
+                logger.info(f'步骤 {step.step_name} 不满足执行条件，跳过')
+                continue
+
+        # 动态调用接口
+        api_func = getattr(pro, config.api_code, None)
+        if not api_func:
+            logger.error(f'步骤 {step.step_name} 的接口 {config.api_code} 不存在')
+            continue
+
+        # 调用接口获取数据
+        try:
+            df = api_func(**api_params)
+        except Exception as api_error:
+            error_detail = f'步骤 {step.step_name} Tushare接口调用失败: {str(api_error)}\n参数: {api_params}'
+            logger.exception(error_detail)
+            # 记录错误日志
+            step_duration = int((datetime.now() - step_start_time).total_seconds())
+            log = TushareDownloadLog(
+                task_id=task.task_id,
+                task_name=f'{task_name}[{step.step_name}]',
+                config_id=config.config_id,
+                api_name=config.api_name,
+                download_date=download_date,
+                record_count=0,
+                file_path=None,
+                status='1',
+                error_message=error_detail,
+                duration=step_duration,
+                create_time=datetime.now(),
+            )
+            await TushareDownloadLogDao.add_log_dao(session, log)
+            continue
+
+        if df is None or df.empty:
+            logger.warning(f'步骤 {step.step_name} 下载数据为空')
+            record_count = 0
+            file_path = None
+        else:
+            record_count = len(df)
+            total_record_count += record_count
+
+            # 如果指定了数据字段，只保留指定字段
+            if config.data_fields:
+                data_fields = json.loads(config.data_fields)
+                if isinstance(data_fields, list):
+                    available_fields = [field for field in data_fields if field in df.columns]
+                    if available_fields:
+                        df = df[available_fields]
+
+            # 保存前一步的结果（供后续步骤使用）
+            # 将 DataFrame 转换为字典列表，方便后续步骤使用
+            previous_results[step.step_name] = df.to_dict('records')
+            if len(previous_results[step.step_name]) > 0:
+                # 保存第一条记录的主要字段，方便条件判断
+                first_record = previous_results[step.step_name][0]
+                for key, value in first_record.items():
+                    previous_results[f'{step.step_name}.{key}'] = value
+
+            # 保存到数据库（如果启用）
+            if task.save_to_db == '1':
+                try:
+                    # 优先使用步骤配置的表名，其次使用任务配置的表名，最后使用默认表名
+                    table_name = step.data_table_name if hasattr(step, 'data_table_name') and step.data_table_name and step.data_table_name.strip() else None
+                    if not table_name:
+                        table_name = task.data_table_name
+                    if not table_name or table_name.strip() == '':
+                        table_name = f'tushare_{config.api_code}'
+                    
+                    await ensure_table_exists(session, table_name, config.api_code, df)
+                    await TushareDataDao.add_dataframe_to_table_dao(session, table_name, df, task.task_id, config.config_id, config.api_code, download_date)
+                    logger.info(f'步骤 {step.step_name} 已保存 {len(df)} 条数据到数据库表 {table_name}')
+                except Exception as db_error:
+                    error_detail = f'步骤 {step.step_name} 保存数据到数据库失败: {str(db_error)}'
+                    logger.exception(error_detail)
+                    # 记录错误但继续执行后续步骤
+                    step_duration = int((datetime.now() - step_start_time).total_seconds())
+                    log = TushareDownloadLog(
+                        task_id=task.task_id,
+                        task_name=f'{task_name}[{step.step_name}]',
+                        config_id=config.config_id,
+                        api_name=config.api_name,
+                        download_date=download_date,
+                        record_count=record_count,
+                        file_path=None,
+                        status='1',
+                        error_message=error_detail,
+                        duration=step_duration,
+                        create_time=datetime.now(),
+                    )
+                    await TushareDownloadLogDao.add_log_dao(session, log)
+                    continue
+
+            # 保存到文件（如果配置了保存路径）
+            file_path = None
+            if task.save_path:
+                try:
+                    save_path = task.save_path
+                    os.makedirs(save_path, exist_ok=True)
+                    file_name = f"{config.api_code}_{step.step_order}_{download_date}_{datetime.now().strftime('%H%M%S')}"
+                    save_format = task.save_format or 'csv'
+
+                    if save_format == 'csv':
+                        file_path = os.path.join(save_path, f'{file_name}.csv')
+                        df.to_csv(file_path, index=False, encoding='utf-8-sig')
+                    elif save_format == 'excel':
+                        file_path = os.path.join(save_path, f'{file_name}.xlsx')
+                        df.to_excel(file_path, index=False, engine='openpyxl')
+                    elif save_format == 'json':
+                        file_path = os.path.join(save_path, f'{file_name}.json')
+                        df.to_json(file_path, orient='records', force_ascii=False, indent=2)
+                    else:
+                        file_path = os.path.join(save_path, f'{file_name}.csv')
+                        df.to_csv(file_path, index=False, encoding='utf-8-sig')
+
+                    logger.info(f'步骤 {step.step_name} 数据已保存到文件: {file_path}')
+                except Exception as file_error:
+                    error_detail = f'步骤 {step.step_name} 保存数据到文件失败: {str(file_error)}'
+                    logger.exception(error_detail)
+                    # 记录错误但继续执行后续步骤
+
+        # 计算步骤执行时长
+        step_duration = int((datetime.now() - step_start_time).total_seconds())
+
+        # 创建步骤下载日志
+        log = TushareDownloadLog(
+            task_id=task.task_id,
+            task_name=f'{task_name}[{step.step_name}]',
+            config_id=config.config_id,
+            api_name=config.api_name,
+            download_date=download_date,
+            record_count=record_count,
+            file_path=file_path,
+            status='0',
+            duration=step_duration,
+            create_time=datetime.now(),
+        )
+        await TushareDownloadLogDao.add_log_dao(session, log)
+
+    # 计算总执行时长
+    duration = int((datetime.now() - start_time).total_seconds())
+
+    # 更新任务统计（使用字典方式，避免被排除列表影响）
+    update_stats_dict = {
+        'run_count': (task.run_count or 0) + 1,
+        'success_count': (task.success_count or 0) + 1,
+        'last_run_time': datetime.now()
+    }
+    await TushareDownloadTaskDao.edit_task_dao(session, task.task_id, update_stats_dict)
+    
+    await session.commit()
+    logger.info(f'流程任务 {task_name} 执行完成，总记录数: {total_record_count}, 总耗时: {duration}秒')
+
+
 async def download_tushare_data(task_id: int, download_date: str | None = None, session: AsyncSession | None = None) -> None:
     """
     下载Tushare数据的异步任务函数
@@ -259,166 +686,17 @@ async def download_tushare_data(task_id: int, download_date: str | None = None, 
             # 保存任务名称，避免在异常处理中访问 ORM 对象
             task_name = task.task_name
 
-            # 获取接口配置信息
-            config = await TushareApiConfigDao.get_config_detail_by_id(session, task.config_id)
-            if not config:
-                logger.error(f'接口配置ID {task.config_id} 不存在')
-                return
-            
-            # 保存配置信息，避免在异常处理中访问 ORM 对象
-            config_id = config.config_id
-            api_name = config.api_name
-
-            if config.status != '0':
-                logger.warning(f'接口配置 {config.api_name} 已停用')
-                return
-
             # 确定下载日期
             if download_date is None:
                 download_date = datetime.now().strftime('%Y%m%d')
 
-            # 解析参数
-            api_params = {}
-            if config.api_params:
-                api_params = json.loads(config.api_params)
-
-            # 任务参数覆盖接口默认参数
-            if task.task_params:
-                task_params = json.loads(task.task_params)
-                api_params.update(task_params)
-
-            # 如果任务指定了日期范围，使用任务日期
-            if task.start_date and task.end_date:
-                api_params['start_date'] = task.start_date
-                api_params['end_date'] = task.end_date
-            elif download_date:
-                # 如果没有指定日期范围，使用单日期
-                api_params['trade_date'] = download_date
-
-            # 调用tushare接口
-            logger.info(f'开始下载任务: {task.task_name}, 接口: {config.api_code}, 参数: {api_params}')
-
-            # 获取tushare pro接口
-            # 优先从配置类获取，如果没有则从环境变量获取
-            ts_token = TushareConfig.tushare_token or os.getenv('TUSHARE_TOKEN', '')
-            if not ts_token:
-                raise ValueError(
-                    'TUSHARE_TOKEN未设置，请在.env.dev文件中配置TUSHARE_TOKEN环境变量。'
-                    '例如：TUSHARE_TOKEN=your_tushare_token_here'
-                )
-
-            pro = ts.pro_api(ts_token)
-
-            # 动态调用接口
-            api_func = getattr(pro, config.api_code, None)
-            if not api_func:
-                raise ValueError(f'接口 {config.api_code} 不存在')
-
-            # 调用接口获取数据
-            try:
-                df = api_func(**api_params)
-            except Exception as api_error:
-                error_detail = f'Tushare接口调用失败: {str(api_error)}\n参数: {api_params}'
-                logger.exception(f'任务 {task.task_name} Tushare接口调用异常: {error_detail}')
-                raise Exception(error_detail) from api_error
-
-            if df is None or df.empty:
-                logger.warning(f'任务 {task.task_name} 下载数据为空')
-                record_count = 0
+            # 如果任务有流程配置ID，执行流程；否则执行单个接口
+            if task.workflow_id:
+                await execute_workflow(session, task, download_date)
             else:
-                record_count = len(df)
+                await execute_single_api(session, task, download_date)
 
-                # 如果指定了数据字段，只保留指定字段
-                if config.data_fields:
-                    data_fields = json.loads(config.data_fields)
-                    if isinstance(data_fields, list):
-                        # 只保留存在的字段
-                        available_fields = [field for field in data_fields if field in df.columns]
-                        if available_fields:
-                            df = df[available_fields]
-
-                # 保存到数据库（如果启用）
-                if task.save_to_db == '1':
-                    try:
-                        # 确定表名：如果未指定，则使用 tushare_ + api_code
-                        table_name = task.data_table_name
-                        if not table_name or table_name.strip() == '':
-                            table_name = f'tushare_{config.api_code}'
-                        
-                        # 确保表存在（如果不存在则根据 DataFrame 结构创建）
-                        await ensure_table_exists(session, table_name, config.api_code, df)
-                        
-                        # 准备批量插入数据（直接插入到对应列，而不是 JSONB）
-                        await TushareDataDao.add_dataframe_to_table_dao(session, table_name, df, task.task_id, config.config_id, config.api_code, download_date)
-                        logger.info(f'已保存 {len(df)} 条数据到数据库表 {table_name}')
-                    except Exception as db_error:
-                        error_detail = f'保存数据到数据库失败: {str(db_error)}\n表名: {table_name}, 记录数: {len(data_list) if "data_list" in locals() else 0}'
-                        logger.exception(f'任务 {task.task_name} 保存数据到数据库异常: {error_detail}')
-                        raise Exception(error_detail) from db_error
-
-                # 保存到文件（如果配置了保存路径）
-                file_path = None
-                if task.save_path:
-                    try:
-                        save_path = task.save_path
-                        os.makedirs(save_path, exist_ok=True)
-
-                        # 生成文件名
-                        file_name = f"{config.api_code}_{download_date}_{datetime.now().strftime('%H%M%S')}"
-                        save_format = task.save_format or 'csv'
-
-                        if save_format == 'csv':
-                            file_path = os.path.join(save_path, f'{file_name}.csv')
-                            df.to_csv(file_path, index=False, encoding='utf-8-sig')
-                        elif save_format == 'excel':
-                            file_path = os.path.join(save_path, f'{file_name}.xlsx')
-                            df.to_excel(file_path, index=False, engine='openpyxl')
-                        elif save_format == 'json':
-                            file_path = os.path.join(save_path, f'{file_name}.json')
-                            df.to_json(file_path, orient='records', force_ascii=False, indent=2)
-                        else:
-                            file_path = os.path.join(save_path, f'{file_name}.csv')
-                            df.to_csv(file_path, index=False, encoding='utf-8-sig')
-
-                        logger.info(f'数据已保存到文件: {file_path}')
-                    except Exception as file_error:
-                        error_detail = f'保存数据到文件失败: {str(file_error)}\n保存路径: {task.save_path}, 格式: {save_format}'
-                        logger.exception(f'任务 {task.task_name} 保存数据到文件异常: {error_detail}')
-                        # 文件保存失败不影响整体流程，只记录错误
-                        raise Exception(error_detail) from file_error
-
-            # 计算执行时长
-            duration = int((datetime.now() - start_time).total_seconds())
-
-            # 创建下载日志
-            file_path_value = file_path if record_count > 0 else None
-            log = TushareDownloadLog(
-                task_id=task.task_id,
-                task_name=task.task_name,
-                config_id=config.config_id,
-                api_name=config.api_name,
-                download_date=download_date,
-                record_count=record_count,
-                file_path=file_path_value,
-                status='0',
-                duration=duration,
-                create_time=datetime.now(),
-            )
-
-            await TushareDownloadLogDao.add_log_dao(session, log)
-            
-            # 更新任务统计
-            task_model = TushareDownloadTaskModel(
-                taskId=task.task_id,
-                runCount=(task.run_count or 0) + 1,
-                successCount=(task.success_count or 0) + 1,
-                lastRunTime=datetime.now()
-            )
-            await TushareDownloadTaskDao.edit_task_dao(session, task_model)
-            
-            await session.commit()
-
-            logger.info(f'任务 {task_name or task.task_name if task else task_id} 执行成功，记录数: {record_count}, 耗时: {duration}秒')
+            logger.info(f'任务 {task_name or task.task_name if task else task_id} 执行完成')
         finally:
             # 如果使用的是外部会话，不关闭它；否则关闭内部创建的会话
             if session_context is not None:
@@ -461,16 +739,15 @@ async def download_tushare_data(task_id: int, download_date: str | None = None, 
                     if task and config and task_name and config_id and api_name:
                         duration = int((datetime.now() - start_time).total_seconds())
                         
-                        # 更新任务统计
+                        # 更新任务统计（使用字典方式，避免被排除列表影响）
                         error_task = await TushareDownloadTaskDao.get_task_detail_by_id(session, task.task_id)
                         if error_task:
-                            task_model = TushareDownloadTaskModel(
-                                taskId=task.task_id,
-                                runCount=(error_task.run_count or 0) + 1,
-                                failCount=(error_task.fail_count or 0) + 1,
-                                lastRunTime=datetime.now()
-                            )
-                            await TushareDownloadTaskDao.edit_task_dao(session, task_model)
+                            update_stats_dict = {
+                                'run_count': (error_task.run_count or 0) + 1,
+                                'fail_count': (error_task.fail_count or 0) + 1,
+                                'last_run_time': datetime.now()
+                            }
+                            await TushareDownloadTaskDao.edit_task_dao(session, task.task_id, update_stats_dict)
                             await session.commit()
 
                         log = TushareDownloadLog(

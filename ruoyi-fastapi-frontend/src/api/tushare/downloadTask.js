@@ -63,3 +63,11 @@ export function executeDownloadTask(taskId) {
     method: 'post'
   })
 }
+
+// 获取Tushare下载任务统计信息
+export function getDownloadTaskStatistics(taskId) {
+  return request({
+    url: '/tushare/downloadTask/statistics/' + taskId,
+    method: 'get'
+  })
+}

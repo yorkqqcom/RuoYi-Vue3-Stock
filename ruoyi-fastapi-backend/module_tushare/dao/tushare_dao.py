@@ -11,6 +11,8 @@ from module_tushare.entity.do.tushare_do import (
     TushareData,
     TushareDownloadLog,
     TushareDownloadTask,
+    TushareWorkflowConfig,
+    TushareWorkflowStep,
 )
 from module_tushare.entity.vo.tushare_vo import (
     TushareApiConfigModel,
@@ -20,6 +22,10 @@ from module_tushare.entity.vo.tushare_vo import (
     TushareDownloadLogPageQueryModel,
     TushareDownloadTaskModel,
     TushareDownloadTaskPageQueryModel,
+    TushareWorkflowConfigModel,
+    TushareWorkflowConfigPageQueryModel,
+    TushareWorkflowStepModel,
+    TushareWorkflowStepPageQueryModel,
 )
 from utils.common_util import CamelCaseUtil
 from utils.page_util import PageUtil
@@ -199,20 +205,60 @@ class TushareDownloadTaskDao:
         :param is_page: 是否开启分页
         :return: 任务列表信息对象
         """
-        query = (
-            select(TushareDownloadTask)
-            .where(
-                TushareDownloadTask.task_name.like(f'%{query_object.task_name}%') if query_object.task_name else True,
-                TushareDownloadTask.config_id == query_object.config_id if query_object.config_id else True,
-                TushareDownloadTask.status == query_object.status if query_object.status else True,
-            )
-            .order_by(TushareDownloadTask.task_id)
-            .distinct()
-        )
+        # 构建查询条件列表
+        conditions = []
+        
+        # 任务名称模糊查询
+        if query_object.task_name:
+            conditions.append(TushareDownloadTask.task_name.like(f'%{query_object.task_name}%'))
+        
+        # 接口配置ID精确查询
+        if query_object.config_id is not None:
+            conditions.append(TushareDownloadTask.config_id == query_object.config_id)
+        
+        # 流程配置ID精确查询
+        if query_object.workflow_id is not None:
+            conditions.append(TushareDownloadTask.workflow_id == query_object.workflow_id)
+        
+        # 状态精确查询
+        if query_object.status is not None:
+            conditions.append(TushareDownloadTask.status == query_object.status)
+        
+        # 根据任务类型筛选（task_type: single -> workflow_id is None, workflow -> workflow_id is not None）
+        from utils.log_util import logger
+        task_type_value = getattr(query_object, 'task_type', None) if hasattr(query_object, 'task_type') else None
+        logger.info(f'[DAO查询任务列表] task_type参数值: {task_type_value}, 类型: {type(task_type_value)}')
+        
+        # 只有当 task_type 有明确的值（不是 None、空字符串或空值）时才添加过滤条件
+        if task_type_value and task_type_value.strip() if isinstance(task_type_value, str) else task_type_value:
+            if task_type_value == 'single':
+                conditions.append(TushareDownloadTask.workflow_id.is_(None))
+                logger.info(f'[DAO查询任务列表] 添加条件: workflow_id IS NULL (single类型)')
+            elif task_type_value == 'workflow':
+                conditions.append(TushareDownloadTask.workflow_id.isnot(None))
+                logger.info(f'[DAO查询任务列表] 添加条件: workflow_id IS NOT NULL (workflow类型)')
+        else:
+            logger.info(f'[DAO查询任务列表] 未指定task_type或task_type为空，返回所有类型的任务')
+        
+        # 构建查询
+        query = select(TushareDownloadTask)
+        if conditions:
+            query = query.where(*conditions)
+        query = query.order_by(TushareDownloadTask.task_id).distinct()
+        
+        logger.info(f'[DAO查询任务列表] 查询条件数量: {len(conditions)}')
+        logger.info(f'[DAO查询任务列表] 分页参数: page_num={query_object.page_num}, page_size={query_object.page_size}, is_page={is_page}')
 
         config_list: PageModel | list[dict[str, Any]] = await PageUtil.paginate(
             db, query, query_object.page_num, query_object.page_size, is_page
         )
+        
+        logger.info(f'[DAO查询任务列表] 查询结果类型: {type(config_list)}')
+        if isinstance(config_list, dict) and 'rows' in config_list:
+            logger.info(f'[DAO查询任务列表] 分页结果: total={config_list.get("total")}, rows数量={len(config_list.get("rows", []))}')
+        elif isinstance(config_list, list):
+            logger.info(f'[DAO查询任务列表] 列表结果数量: {len(config_list)}')
+        
         return config_list
 
     @classmethod
@@ -224,7 +270,19 @@ class TushareDownloadTaskDao:
         :param task: 任务对象
         :return: 任务对象
         """
-        db_task = TushareDownloadTask(**task.model_dump(exclude={'task_id'}))
+        # 使用 by_alias=False 确保使用 snake_case 字段名，与数据库字段匹配
+        # 使用 exclude_none=False 确保所有字段（包括None值）都被包含，避免字段丢失
+        task_dict = task.model_dump(exclude={'task_id'}, by_alias=False, exclude_none=False)
+        from utils.log_util import logger
+        logger.info(f'[DAO新增任务] 准备插入的字典: {task_dict}')
+        logger.info(f'[DAO新增任务] task_name值: {task_dict.get("task_name")}')
+        
+        # 确保 task_name 不为空
+        if not task_dict.get('task_name') or (isinstance(task_dict.get('task_name'), str) and not task_dict.get('task_name').strip()):
+            logger.error(f'[DAO新增任务] task_name为空或无效: {task_dict.get("task_name")}')
+            raise ValueError('任务名称不能为空')
+        
+        db_task = TushareDownloadTask(**task_dict)
         db.add(db_task)
         await db.flush()
         await db.refresh(db_task)
@@ -271,12 +329,18 @@ class TushareDownloadTaskDao:
         
         # 从字典中移除 task_id，因为它只用于 WHERE 条件
         update_dict = {k: v for k, v in task_dict.items() if k != 'task_id'}
-        # 再次排除不应该更新的字段
-        excluded_fields = {
-            'last_run_time', 'next_run_time', 'run_count', 'success_count', 'fail_count',
-            'create_by', 'create_time'
-        }
-        update_dict = {k: v for k, v in update_dict.items() if k not in excluded_fields}
+        
+        # 如果是通过模型对象方式调用，需要排除不应该更新的字段
+        # 如果是通过字典方式调用，则信任调用者，允许更新所有字段（包括统计字段）
+        if isinstance(task_id_or_model, TushareDownloadTaskModel):
+            excluded_fields = {
+                'last_run_time', 'next_run_time', 'run_count', 'success_count', 'fail_count',
+                'create_by', 'create_time'
+            }
+            update_dict = {k: v for k, v in update_dict.items() if k not in excluded_fields}
+        
+        # 过滤掉 None 值，避免更新必填字段为 None
+        update_dict = {k: v for k, v in update_dict.items() if v is not None}
         
         logger.info(f'[DAO编辑任务] 准备更新的字段字典: {update_dict}')
         logger.info(f'[DAO编辑任务] 字典键: {list(update_dict.keys())}')
@@ -306,6 +370,28 @@ class TushareDownloadTaskDao:
         result = await db.execute(delete(TushareDownloadTask).where(TushareDownloadTask.task_id.in_(task_ids)))
         return result.rowcount
 
+    @classmethod
+    async def get_tasks_for_scheduler(cls, db: AsyncSession) -> list[TushareDownloadTask]:
+        """
+        查询所有需要注册到调度器的任务（状态为启用且有cron表达式）
+
+        :param db: orm对象
+        :return: 任务列表
+        """
+        tasks = (
+            await db.execute(
+                select(TushareDownloadTask)
+                .where(
+                    TushareDownloadTask.status == '0',  # 状态为启用
+                    TushareDownloadTask.cron_expression.isnot(None),  # cron表达式不为空
+                    TushareDownloadTask.cron_expression != '',  # cron表达式不为空字符串
+                )
+                .order_by(TushareDownloadTask.task_id)
+            )
+        ).scalars().all()
+
+        return list(tasks)
+
 
 class TushareDownloadLogDao:
     """
@@ -324,12 +410,25 @@ class TushareDownloadLogDao:
         :param is_page: 是否开启分页
         :return: 日志列表信息对象
         """
+        from module_tushare.entity.do.tushare_do import TushareDownloadTask
+        
+        # 根据任务类型筛选（通过关联任务表判断）
+        task_type_filter = True
+        if hasattr(query_object, 'task_type') and query_object.task_type:
+            if query_object.task_type == 'single':
+                # 单个接口任务：task_name 不包含 [，且关联的任务 workflow_id 为 None
+                task_type_filter = ~TushareDownloadLog.task_name.like('%[%')
+            elif query_object.task_type == 'workflow':
+                # 流程配置任务：task_name 包含 [
+                task_type_filter = TushareDownloadLog.task_name.like('%[%')
+        
         query = (
             select(TushareDownloadLog)
             .where(
                 TushareDownloadLog.task_id == query_object.task_id if query_object.task_id else True,
                 TushareDownloadLog.task_name.like(f'%{query_object.task_name}%') if query_object.task_name else True,
                 TushareDownloadLog.status == query_object.status if query_object.status else True,
+                task_type_filter,
             )
             .order_by(TushareDownloadLog.log_id.desc())
             .distinct()
@@ -604,4 +703,247 @@ class TushareDataDao:
         :return: 删除结果
         """
         result = await db.execute(delete(TushareData))
+        return result.rowcount
+
+
+class TushareWorkflowConfigDao:
+    """
+    Tushare流程配置管理模块数据库操作层
+    """
+
+    @classmethod
+    async def get_workflow_detail_by_id(cls, db: AsyncSession, workflow_id: int) -> TushareWorkflowConfig | None:
+        """
+        根据流程ID获取流程详细信息
+
+        :param db: orm对象
+        :param workflow_id: 流程ID
+        :return: 流程信息对象
+        """
+        workflow_info = (
+            await db.execute(select(TushareWorkflowConfig).where(TushareWorkflowConfig.workflow_id == workflow_id))
+        ).scalars().first()
+
+        return workflow_info
+
+    @classmethod
+    async def get_workflow_detail_by_info(
+        cls, db: AsyncSession, workflow: TushareWorkflowConfigModel
+    ) -> TushareWorkflowConfig | None:
+        """
+        根据流程参数获取流程信息
+
+        :param db: orm对象
+        :param workflow: 流程参数对象
+        :return: 流程信息对象
+        """
+        workflow_info = (
+            (
+                await db.execute(
+                    select(TushareWorkflowConfig).where(
+                        TushareWorkflowConfig.workflow_name == workflow.workflow_name,
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+        return workflow_info
+
+    @classmethod
+    async def get_workflow_list(
+        cls, db: AsyncSession, query_object: TushareWorkflowConfigPageQueryModel, is_page: bool = False
+    ) -> PageModel | list[dict[str, Any]]:
+        """
+        根据查询参数获取流程列表信息
+
+        :param db: orm对象
+        :param query_object: 查询参数对象
+        :param is_page: 是否开启分页
+        :return: 流程列表信息对象
+        """
+        query = (
+            select(TushareWorkflowConfig)
+            .where(
+                TushareWorkflowConfig.workflow_name.like(f'%{query_object.workflow_name}%')
+                if query_object.workflow_name
+                else True,
+                TushareWorkflowConfig.status == query_object.status if query_object.status else True,
+            )
+            .order_by(TushareWorkflowConfig.workflow_id)
+            .distinct()
+        )
+
+        workflow_list: PageModel | list[dict[str, Any]] = await PageUtil.paginate(
+            db, query, query_object.page_num, query_object.page_size, is_page
+        )
+        return workflow_list
+
+    @classmethod
+    async def add_workflow_dao(cls, db: AsyncSession, workflow: TushareWorkflowConfigModel) -> TushareWorkflowConfig:
+        """
+        新增流程信息
+
+        :param db: orm对象
+        :param workflow: 流程对象
+        :return: 流程对象
+        """
+        db_workflow = TushareWorkflowConfig(**workflow.model_dump(exclude={'workflow_id'}))
+        db.add(db_workflow)
+        await db.flush()
+        await db.refresh(db_workflow)
+        return db_workflow
+
+    @classmethod
+    async def edit_workflow_dao(cls, db: AsyncSession, workflow: TushareWorkflowConfigModel) -> int:
+        """
+        编辑流程信息
+
+        :param db: orm对象
+        :param workflow: 流程对象
+        :return: 编辑结果
+        """
+        await db.execute(
+            update(TushareWorkflowConfig)
+            .where(TushareWorkflowConfig.workflow_id == workflow.workflow_id)
+            .values(**workflow.model_dump(exclude={'workflow_id'}, exclude_none=True))
+        )
+        return workflow.workflow_id
+
+    @classmethod
+    async def delete_workflow_dao(cls, db: AsyncSession, workflow_ids: Sequence[int]) -> int:
+        """
+        删除流程信息
+
+        :param db: orm对象
+        :param workflow_ids: 流程ID列表
+        :return: 删除结果
+        """
+        result = await db.execute(
+            delete(TushareWorkflowConfig).where(TushareWorkflowConfig.workflow_id.in_(workflow_ids))
+        )
+        return result.rowcount
+
+
+class TushareWorkflowStepDao:
+    """
+    Tushare流程步骤管理模块数据库操作层
+    """
+
+    @classmethod
+    async def get_step_detail_by_id(cls, db: AsyncSession, step_id: int) -> TushareWorkflowStep | None:
+        """
+        根据步骤ID获取步骤详细信息
+
+        :param db: orm对象
+        :param step_id: 步骤ID
+        :return: 步骤信息对象
+        """
+        step_info = (
+            await db.execute(select(TushareWorkflowStep).where(TushareWorkflowStep.step_id == step_id))
+        ).scalars().first()
+
+        return step_info
+
+    @classmethod
+    async def get_steps_by_workflow_id(cls, db: AsyncSession, workflow_id: int) -> list[TushareWorkflowStep]:
+        """
+        根据流程ID获取所有步骤
+
+        :param db: orm对象
+        :param workflow_id: 流程ID
+        :return: 步骤列表
+        """
+        steps = (
+            await db.execute(
+                select(TushareWorkflowStep)
+                .where(TushareWorkflowStep.workflow_id == workflow_id)
+                .order_by(TushareWorkflowStep.step_order)
+            )
+        ).scalars().all()
+
+        return list(steps)
+
+    @classmethod
+    async def get_step_list(
+        cls, db: AsyncSession, query_object: TushareWorkflowStepPageQueryModel, is_page: bool = False
+    ) -> PageModel | list[dict[str, Any]]:
+        """
+        根据查询参数获取步骤列表信息
+
+        :param db: orm对象
+        :param query_object: 查询参数对象
+        :param is_page: 是否开启分页
+        :return: 步骤列表信息对象
+        """
+        query = (
+            select(TushareWorkflowStep)
+            .where(
+                TushareWorkflowStep.workflow_id == query_object.workflow_id if query_object.workflow_id else True,
+                TushareWorkflowStep.step_name.like(f'%{query_object.step_name}%') if query_object.step_name else True,
+                TushareWorkflowStep.config_id == query_object.config_id if query_object.config_id else True,
+                TushareWorkflowStep.status == query_object.status if query_object.status else True,
+            )
+            .order_by(TushareWorkflowStep.workflow_id, TushareWorkflowStep.step_order)
+        )
+
+        step_list: PageModel | list[dict[str, Any]] = await PageUtil.paginate(
+            db, query, query_object.page_num, query_object.page_size, is_page
+        )
+        return step_list
+
+    @classmethod
+    async def add_step_dao(cls, db: AsyncSession, step: TushareWorkflowStepModel) -> TushareWorkflowStep:
+        """
+        新增步骤信息
+
+        :param db: orm对象
+        :param step: 步骤对象
+        :return: 步骤对象
+        """
+        db_step = TushareWorkflowStep(**step.model_dump(exclude={'step_id'}))
+        db.add(db_step)
+        await db.flush()
+        await db.refresh(db_step)
+        return db_step
+
+    @classmethod
+    async def edit_step_dao(cls, db: AsyncSession, step: TushareWorkflowStepModel) -> int:
+        """
+        编辑步骤信息
+
+        :param db: orm对象
+        :param step: 步骤对象
+        :return: 编辑结果
+        """
+        await db.execute(
+            update(TushareWorkflowStep)
+            .where(TushareWorkflowStep.step_id == step.step_id)
+            .values(**step.model_dump(exclude={'step_id'}, exclude_none=True))
+        )
+        return step.step_id
+
+    @classmethod
+    async def delete_step_dao(cls, db: AsyncSession, step_ids: Sequence[int]) -> int:
+        """
+        删除步骤信息
+
+        :param db: orm对象
+        :param step_ids: 步骤ID列表
+        :return: 删除结果
+        """
+        result = await db.execute(delete(TushareWorkflowStep).where(TushareWorkflowStep.step_id.in_(step_ids)))
+        return result.rowcount
+
+    @classmethod
+    async def delete_steps_by_workflow_id(cls, db: AsyncSession, workflow_id: int) -> int:
+        """
+        根据流程ID删除所有步骤
+
+        :param db: orm对象
+        :param workflow_id: 流程ID
+        :return: 删除结果
+        """
+        result = await db.execute(delete(TushareWorkflowStep).where(TushareWorkflowStep.workflow_id == workflow_id))
         return result.rowcount

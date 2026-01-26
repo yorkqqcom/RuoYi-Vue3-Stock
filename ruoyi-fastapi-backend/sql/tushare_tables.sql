@@ -97,3 +97,73 @@ create table tushare_data (
   key idx_download_date_data (download_date),
   key idx_create_time_data (create_time)
 ) engine=innodb auto_increment=1 comment = 'Tushare数据存储表（通用表）';
+
+-- ----------------------------
+-- 5、Tushare流程配置表
+-- ----------------------------
+drop table if exists tushare_workflow_config;
+create table tushare_workflow_config (
+  workflow_id          bigint(20)      not null auto_increment    comment '流程ID',
+  workflow_name        varchar(100)    not null                    comment '流程名称',
+  workflow_desc        text                                        comment '流程描述',
+  status               char(1)         default '0'                 comment '状态（0正常 1停用）',
+  create_by            varchar(64)     default ''                  comment '创建者',
+  create_time          datetime                                     comment '创建时间',
+  update_by            varchar(64)     default ''                  comment '更新者',
+  update_time          datetime                                     comment '更新时间',
+  remark               varchar(500)    default ''                  comment '备注信息',
+  primary key (workflow_id),
+  unique key uk_workflow_name (workflow_name)
+) engine=innodb auto_increment=1 comment = 'Tushare流程配置表';
+
+-- ----------------------------
+-- 6、Tushare流程步骤表
+-- ----------------------------
+drop table if exists tushare_workflow_step;
+create table tushare_workflow_step (
+  step_id              bigint(20)      not null auto_increment    comment '步骤ID',
+  workflow_id          bigint(20)      not null                    comment '流程ID',
+  step_order           int(11)         not null                    comment '步骤顺序（从1开始）',
+  step_name            varchar(100)    not null                    comment '步骤名称',
+  config_id            bigint(20)      not null                    comment '接口配置ID',
+  step_params          text                                        comment '步骤参数（JSON格式，可从前一步获取数据）',
+  condition_expr       text                                        comment '执行条件（JSON格式，可选）',
+  status               char(1)         default '0'                 comment '状态（0正常 1停用）',
+  create_by            varchar(64)     default ''                  comment '创建者',
+  create_time          datetime                                     comment '创建时间',
+  update_by            varchar(64)     default ''                  comment '更新者',
+  update_time          datetime                                     comment '更新时间',
+  remark               varchar(500)    default ''                  comment '备注信息',
+  primary key (step_id),
+  key idx_workflow_id (workflow_id),
+  key idx_config_id (config_id),
+  unique key uk_workflow_step_order (workflow_id, step_order)
+) engine=innodb auto_increment=1 comment = 'Tushare流程步骤表';
+
+-- ----------------------------
+-- 修改下载任务表，添加流程配置支持
+-- ----------------------------
+alter table tushare_download_task add column workflow_id bigint(20) comment '流程配置ID（如果存在则执行流程，否则执行单个接口）';
+create index idx_workflow_id_task on tushare_download_task(workflow_id);
+
+-- ----------------------------
+-- 修改下载任务表，添加任务类型字段
+-- ----------------------------
+alter table tushare_download_task add column task_type varchar(20) default 'single' comment '任务类型（single:单个接口 workflow:流程配置）';
+create index idx_task_type on tushare_download_task(task_type);
+
+-- ----------------------------
+-- 修改下载任务表，允许config_id为空（流程配置模式下可以为空）
+-- ----------------------------
+alter table tushare_download_task modify column config_id bigint(20) null comment '接口配置ID';
+
+-- ----------------------------
+-- 扩展流程步骤表，添加可视化编辑器支持字段
+-- ----------------------------
+alter table tushare_workflow_step add column position_x int(11) comment '节点X坐标（用于可视化布局）';
+alter table tushare_workflow_step add column position_y int(11) comment '节点Y坐标（用于可视化布局）';
+alter table tushare_workflow_step add column node_type varchar(20) default 'task' comment '节点类型（start/end/task）';
+alter table tushare_workflow_step add column source_step_ids text comment '前置步骤ID列表（JSON格式，支持多个前置节点）';
+alter table tushare_workflow_step add column target_step_ids text comment '后置步骤ID列表（JSON格式，支持多个后置节点）';
+alter table tushare_workflow_step add column layout_data json comment '完整的布局数据（JSON格式，存储节点位置、连接线等可视化信息）';
+alter table tushare_workflow_step add column data_table_name varchar(100) comment '数据存储表名（为空则使用任务配置的表名或默认表名）';

@@ -14,21 +14,34 @@ from common.enums import BusinessType
 from common.router import APIRouterPro
 from common.vo import DataResponseModel, PageResponseModel, ResponseBaseModel
 from module_tushare.entity.vo.tushare_vo import (
+    BatchSaveWorkflowStepModel,
     DeleteTushareApiConfigModel,
     DeleteTushareDownloadLogModel,
     DeleteTushareDownloadTaskModel,
+    DeleteTushareWorkflowConfigModel,
+    DeleteTushareWorkflowStepModel,
     EditTushareApiConfigModel,
     EditTushareDownloadTaskModel,
+    EditTushareWorkflowConfigModel,
+    EditTushareWorkflowStepModel,
     TushareApiConfigModel,
     TushareApiConfigPageQueryModel,
     TushareDownloadLogPageQueryModel,
     TushareDownloadTaskModel,
+    TushareDownloadTaskDetailModel,
     TushareDownloadTaskPageQueryModel,
+    TushareWorkflowConfigModel,
+    TushareWorkflowConfigPageQueryModel,
+    TushareWorkflowConfigWithStepsModel,
+    TushareWorkflowStepModel,
+    TushareWorkflowStepPageQueryModel,
 )
 from module_tushare.service.tushare_service import (
     TushareApiConfigService,
     TushareDownloadLogService,
     TushareDownloadTaskService,
+    TushareWorkflowConfigService,
+    TushareWorkflowStepService,
 )
 from module_admin.entity.vo.user_vo import CurrentUserModel
 from utils.common_util import bytes2file_response
@@ -246,10 +259,35 @@ async def add_tushare_download_task(
     query_db: Annotated[AsyncSession, DBSessionDependency()],
     current_user: Annotated[CurrentUserModel, CurrentUserDependency()],
 ) -> Response:
+    logger.info(f'[控制器] 接收到新增任务请求')
+    logger.info(f'[控制器] 请求数据(by_alias=True): {add_download_task.model_dump(by_alias=True)}')
+    logger.info(f'[控制器] 请求数据(by_alias=False): {add_download_task.model_dump(by_alias=False)}')
+    logger.info(f'[控制器] task_name值: {add_download_task.task_name}, 类型: {type(add_download_task.task_name)}')
+    logger.info(f'[控制器] 模型字段: {list(add_download_task.model_fields.keys())}')
+    logger.info(f'[控制器] 模型别名: {[field.alias for field in add_download_task.model_fields.values()]}')
+    
+    # 验证必要字段 - 如果为空，尝试从原始数据中恢复
+    if not add_download_task.task_name:
+        logger.error(f'[控制器] task_name为空，尝试从原始数据恢复')
+        logger.error(f'[控制器] 完整模型数据: {add_download_task.model_dump(by_alias=False, exclude_none=False)}')
+        logger.error(f'[控制器] 完整模型数据(by_alias=True): {add_download_task.model_dump(by_alias=True, exclude_none=False)}')
+        
+        # 尝试从 by_alias=True 的字典中获取 taskName
+        alias_dict = add_download_task.model_dump(by_alias=True, exclude_none=False)
+        if 'taskName' in alias_dict and alias_dict['taskName']:
+            logger.info(f'[控制器] 从别名字典中找到taskName: {alias_dict["taskName"]}')
+            add_download_task.task_name = alias_dict['taskName']
+        else:
+            logger.error(f'[控制器] 无法找到taskName，拒绝请求')
+            return ResponseUtil.error(msg='任务名称不能为空')
+    
     add_download_task.create_by = current_user.user.user_name
     add_download_task.create_time = datetime.now()
     add_download_task.update_by = current_user.user.user_name
     add_download_task.update_time = datetime.now()
+    
+    logger.info(f'[控制器] 设置创建信息后的task_name: {add_download_task.task_name}')
+    
     add_download_task_result = await TushareDownloadTaskService.add_task_services(query_db, add_download_task)
     logger.info(add_download_task_result.message)
 
@@ -334,8 +372,8 @@ async def delete_tushare_download_task(
 @tushare_controller.get(
     '/downloadTask/{task_id}',
     summary='获取Tushare下载任务详情接口',
-    description='用于获取指定Tushare下载任务的详情信息',
-    response_model=DataResponseModel[TushareDownloadTaskModel],
+    description='用于获取指定Tushare下载任务的详情信息（包含任务类型、关联接口/流程信息）',
+    response_model=DataResponseModel[TushareDownloadTaskDetailModel],
     dependencies=[UserInterfaceAuthDependency('tushare:downloadTask:query')],
 )
 async def query_detail_tushare_download_task(
@@ -366,6 +404,24 @@ async def execute_tushare_download_task(
     logger.info(execute_task_result.message)
 
     return ResponseUtil.success(msg=execute_task_result.message)
+
+
+@tushare_controller.get(
+    '/downloadTask/statistics/{task_id}',
+    summary='获取Tushare下载任务统计信息接口',
+    description='用于获取指定任务的执行统计信息（区分单个接口和流程配置）',
+    response_model=DataResponseModel,
+    dependencies=[UserInterfaceAuthDependency('tushare:downloadTask:query')],
+)
+async def get_tushare_download_task_statistics(
+    request: Request,
+    task_id: Annotated[int, Path(description='任务ID')],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    statistics_result = await TushareDownloadTaskService.get_task_statistics_services(query_db, task_id)
+    logger.info(f'获取task_id为{task_id}的统计信息成功')
+
+    return ResponseUtil.success(data=statistics_result)
 
 
 # ==================== Tushare下载日志管理 ====================
@@ -427,3 +483,224 @@ async def delete_tushare_download_log(
     logger.info(delete_download_log_result.message)
 
     return ResponseUtil.success(msg=delete_download_log_result.message)
+
+
+# ==================== Tushare流程配置管理 ====================
+
+@tushare_controller.get(
+    '/workflowConfig/list',
+    summary='获取Tushare流程配置分页列表接口',
+    description='用于获取Tushare流程配置分页列表',
+    response_model=PageResponseModel[TushareWorkflowConfigModel],
+    dependencies=[UserInterfaceAuthDependency('tushare:workflowConfig:list')],
+)
+async def get_tushare_workflow_config_list(
+    request: Request,
+    workflow_config_page_query: Annotated[TushareWorkflowConfigPageQueryModel, Query()],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    workflow_config_page_query_result = await TushareWorkflowConfigService.get_workflow_list_services(
+        query_db, workflow_config_page_query, is_page=True
+    )
+    logger.info('获取成功')
+
+    return ResponseUtil.success(model_content=workflow_config_page_query_result)
+
+
+@tushare_controller.post(
+    '/workflowConfig',
+    summary='新增Tushare流程配置接口',
+    description='用于新增Tushare流程配置',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('tushare:workflowConfig:add')],
+)
+@ValidateFields(validate_model='add_workflow_config')
+@Log(title='Tushare流程配置', business_type=BusinessType.INSERT)
+async def add_tushare_workflow_config(
+    request: Request,
+    add_workflow_config: TushareWorkflowConfigModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_user: Annotated[CurrentUserModel, CurrentUserDependency()],
+) -> Response:
+    add_workflow_config.create_by = current_user.user.user_name
+    add_workflow_config.create_time = datetime.now()
+    add_workflow_config.update_by = current_user.user.user_name
+    add_workflow_config.update_time = datetime.now()
+    add_workflow_config_result = await TushareWorkflowConfigService.add_workflow_services(query_db, add_workflow_config)
+    logger.info(add_workflow_config_result.message)
+
+    return ResponseUtil.success(msg=add_workflow_config_result.message)
+
+
+@tushare_controller.put(
+    '/workflowConfig',
+    summary='编辑Tushare流程配置接口',
+    description='用于编辑Tushare流程配置',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('tushare:workflowConfig:edit')],
+)
+@ValidateFields(validate_model='edit_workflow_config')
+@Log(title='Tushare流程配置', business_type=BusinessType.UPDATE)
+async def edit_tushare_workflow_config(
+    request: Request,
+    edit_workflow_config: EditTushareWorkflowConfigModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_user: Annotated[CurrentUserModel, CurrentUserDependency()],
+) -> Response:
+    edit_workflow_config.update_by = current_user.user.user_name
+    edit_workflow_config.update_time = datetime.now()
+    edit_workflow_config_result = await TushareWorkflowConfigService.edit_workflow_services(query_db, edit_workflow_config)
+    logger.info(edit_workflow_config_result.message)
+
+    return ResponseUtil.success(msg=edit_workflow_config_result.message)
+
+
+@tushare_controller.delete(
+    '/workflowConfig/{workflow_ids}',
+    summary='删除Tushare流程配置接口',
+    description='用于删除Tushare流程配置',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('tushare:workflowConfig:remove')],
+)
+@Log(title='Tushare流程配置', business_type=BusinessType.DELETE)
+async def delete_tushare_workflow_config(
+    request: Request,
+    workflow_ids: Annotated[str, Path(description='需要删除的流程配置ID')],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    delete_workflow_config = DeleteTushareWorkflowConfigModel(workflowIds=workflow_ids)
+    delete_workflow_config_result = await TushareWorkflowConfigService.delete_workflow_services(
+        query_db, delete_workflow_config
+    )
+    logger.info(delete_workflow_config_result.message)
+
+    return ResponseUtil.success(msg=delete_workflow_config_result.message)
+
+
+@tushare_controller.get(
+    '/workflowConfig/{workflow_id}',
+    summary='获取Tushare流程配置详情接口',
+    description='用于获取指定Tushare流程配置的详情信息（包含步骤列表）',
+    response_model=DataResponseModel[TushareWorkflowConfigWithStepsModel],
+    dependencies=[UserInterfaceAuthDependency('tushare:workflowConfig:query')],
+)
+async def query_detail_tushare_workflow_config(
+    request: Request,
+    workflow_id: Annotated[int, Path(description='流程配置ID')],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    workflow_config_detail_result = await TushareWorkflowConfigService.workflow_detail_services(query_db, workflow_id)
+
+    return ResponseUtil.success(data=workflow_config_detail_result)
+
+
+# ==================== Tushare流程步骤管理 ====================
+
+@tushare_controller.get(
+    '/workflowStep/list',
+    summary='获取Tushare流程步骤分页列表接口',
+    description='用于获取Tushare流程步骤分页列表',
+    response_model=PageResponseModel[TushareWorkflowStepModel],
+    dependencies=[UserInterfaceAuthDependency('tushare:workflowStep:list')],
+)
+async def get_tushare_workflow_step_list(
+    request: Request,
+    workflow_step_page_query: Annotated[TushareWorkflowStepPageQueryModel, Query()],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    workflow_step_page_query_result = await TushareWorkflowStepService.get_step_list_services(
+        query_db, workflow_step_page_query, is_page=True
+    )
+    logger.info('获取成功')
+
+    return ResponseUtil.success(model_content=workflow_step_page_query_result)
+
+
+@tushare_controller.post(
+    '/workflowStep',
+    summary='新增Tushare流程步骤接口',
+    description='用于新增Tushare流程步骤',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('tushare:workflowStep:add')],
+)
+@ValidateFields(validate_model='add_workflow_step')
+@Log(title='Tushare流程步骤', business_type=BusinessType.INSERT)
+async def add_tushare_workflow_step(
+    request: Request,
+    add_workflow_step: TushareWorkflowStepModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_user: Annotated[CurrentUserModel, CurrentUserDependency()],
+) -> Response:
+    add_workflow_step.create_by = current_user.user.user_name
+    add_workflow_step.create_time = datetime.now()
+    add_workflow_step.update_by = current_user.user.user_name
+    add_workflow_step.update_time = datetime.now()
+    add_workflow_step_result = await TushareWorkflowStepService.add_step_services(query_db, add_workflow_step)
+    logger.info(add_workflow_step_result.message)
+
+    return ResponseUtil.success(msg=add_workflow_step_result.message)
+
+
+@tushare_controller.put(
+    '/workflowStep',
+    summary='编辑Tushare流程步骤接口',
+    description='用于编辑Tushare流程步骤',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('tushare:workflowStep:edit')],
+)
+@ValidateFields(validate_model='edit_workflow_step')
+@Log(title='Tushare流程步骤', business_type=BusinessType.UPDATE)
+async def edit_tushare_workflow_step(
+    request: Request,
+    edit_workflow_step: EditTushareWorkflowStepModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_user: Annotated[CurrentUserModel, CurrentUserDependency()],
+) -> Response:
+    edit_workflow_step.update_by = current_user.user.user_name
+    edit_workflow_step.update_time = datetime.now()
+    edit_workflow_step_result = await TushareWorkflowStepService.edit_step_services(query_db, edit_workflow_step)
+    logger.info(edit_workflow_step_result.message)
+
+    return ResponseUtil.success(msg=edit_workflow_step_result.message)
+
+
+@tushare_controller.delete(
+    '/workflowStep/{step_ids}',
+    summary='删除Tushare流程步骤接口',
+    description='用于删除Tushare流程步骤',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('tushare:workflowStep:remove')],
+)
+@Log(title='Tushare流程步骤', business_type=BusinessType.DELETE)
+async def delete_tushare_workflow_step(
+    request: Request,
+    step_ids: Annotated[str, Path(description='需要删除的流程步骤ID')],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    delete_workflow_step = DeleteTushareWorkflowStepModel(stepIds=step_ids)
+    delete_workflow_step_result = await TushareWorkflowStepService.delete_step_services(query_db, delete_workflow_step)
+    logger.info(delete_workflow_step_result.message)
+
+    return ResponseUtil.success(msg=delete_workflow_step_result.message)
+
+
+@tushare_controller.post(
+    '/workflowStep/batch',
+    summary='批量保存Tushare流程步骤接口',
+    description='用于批量创建、更新、删除流程步骤',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('tushare:workflowStep:edit')],
+)
+@Log(title='Tushare流程步骤', business_type=BusinessType.UPDATE)
+async def batch_save_workflow_steps(
+    request: Request,
+    batch_data: BatchSaveWorkflowStepModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_user: Annotated[CurrentUserModel, CurrentUserDependency()],
+) -> Response:
+    batch_save_result = await TushareWorkflowStepService.batch_save_step_services(
+        query_db, batch_data, current_user.user.user_name
+    )
+    logger.info(batch_save_result.message)
+
+    return ResponseUtil.success(msg=batch_save_result.message)
