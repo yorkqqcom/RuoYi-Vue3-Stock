@@ -111,8 +111,24 @@ class TushareApiConfigService:
         :param edit_config: 编辑接口配置字典
         """
         if page_object.type == 'status':
+            # 只更新状态字段
+            edit_config.clear()
             edit_config['status'] = page_object.status
         else:
+            # model_dump已经包含了所有字段，这里主要处理特殊逻辑
+            # 处理主键字段：空字符串转换为None，确保能正确保存和清空
+            if 'primary_key_fields' in edit_config:
+                primary_key_value = edit_config['primary_key_fields']
+                if primary_key_value is not None and isinstance(primary_key_value, str) and primary_key_value.strip() == '':
+                    edit_config['primary_key_fields'] = None
+            elif hasattr(page_object, 'primary_key_fields'):
+                # 如果不在字典中，尝试从page_object获取
+                if page_object.primary_key_fields is not None and isinstance(page_object.primary_key_fields, str) and page_object.primary_key_fields.strip() == '':
+                    edit_config['primary_key_fields'] = None
+                else:
+                    edit_config['primary_key_fields'] = page_object.primary_key_fields
+            # 确保关键字段被正确设置（覆盖model_dump的结果，确保使用page_object的最新值）
+            # 这样可以确保即使前端没有发送某些字段，也能使用page_object中的值
             edit_config['api_name'] = page_object.api_name
             edit_config['api_code'] = page_object.api_code
             edit_config['api_desc'] = page_object.api_desc
@@ -120,6 +136,11 @@ class TushareApiConfigService:
             edit_config['data_fields'] = page_object.data_fields
             edit_config['status'] = page_object.status
             edit_config['remark'] = page_object.remark
+            # 确保更新时间和更新者被设置
+            if hasattr(page_object, 'update_by') and page_object.update_by:
+                edit_config['update_by'] = page_object.update_by
+            if hasattr(page_object, 'update_time') and page_object.update_time:
+                edit_config['update_time'] = page_object.update_time
 
     @classmethod
     async def edit_config_services(
@@ -132,6 +153,11 @@ class TushareApiConfigService:
         :param page_object: 编辑接口配置对象
         :return: 编辑接口配置校验结果
         """
+        # 验证config_id是否存在
+        if not page_object.config_id:
+            logger.error(f'config_id为空或无效: {page_object.config_id}')
+            raise ServiceException(message='接口配置ID不能为空，无法执行更新操作')
+        
         old_config = await TushareApiConfigDao.get_config_detail_by_id(query_db, page_object.config_id)
         if not old_config:
             raise ServiceException(message='接口配置不存在')
@@ -143,9 +169,43 @@ class TushareApiConfigService:
             if not await cls.check_config_unique_services(query_db, check_config):
                 raise ServiceException(message=f'编辑接口配置{page_object.api_name}失败，接口代码已存在')
         try:
-            edit_config_dict = page_object.model_dump(exclude={'config_id', 'type'}, exclude_none=True)
+            # 验证config_id不为None
+            if page_object.config_id is None:
+                raise ServiceException(message='接口配置ID不能为空，无法执行更新操作')
+            
+            # 处理主键字段：空字符串转换为None，确保能正确保存和清空
+            primary_key_fields_value = page_object.primary_key_fields
+            if primary_key_fields_value is not None and isinstance(primary_key_fields_value, str) and primary_key_fields_value.strip() == '':
+                primary_key_fields_value = None
+            
+            # 使用model_dump获取所有字段值，使用by_alias=False确保使用snake_case字段名
+            # 排除type字段，因为它只是操作类型标识，不需要保存到数据库
+            edit_config_dict = page_object.model_dump(
+                exclude={'type'},
+                exclude_none=False,
+                by_alias=False
+            )
+            
+            # 确保config_id在字典中
+            edit_config_dict['config_id'] = page_object.config_id
+            
+            # 处理需要特殊处理的字段
+            edit_config_dict['primary_key_fields'] = primary_key_fields_value
+            # 保留原有的创建信息
+            edit_config_dict['create_by'] = old_config.create_by if old_config.create_by else None
+            edit_config_dict['create_time'] = old_config.create_time if old_config.create_time else None
+            
+            # 调用_deal_edit_config处理编辑逻辑
             cls._deal_edit_config(page_object, edit_config_dict)
-            await TushareApiConfigDao.edit_config_dao(query_db, TushareApiConfigModel(**edit_config_dict))
+            
+            # 验证config_id在字典中且不为None
+            config_id = edit_config_dict.get('config_id')
+            if config_id is None:
+                logger.error(f'edit_config_dict中config_id为None。edit_config_dict: {edit_config_dict}')
+                raise ServiceException(message='接口配置ID验证失败，edit_config_dict中config_id为None')
+            
+            # 直接使用字典更新，避免模型对象创建时的字段映射问题
+            await TushareApiConfigDao.edit_config_dao(query_db, config_id, edit_config_dict)
             await query_db.commit()
             result = {'is_success': True, 'message': '编辑成功'}
         except Exception as e:
@@ -385,6 +445,89 @@ class TushareDownloadTaskService:
         # 刷新对象以确保所有属性都已加载，避免延迟加载导致的 greenlet 错误
         await query_db.refresh(old_task)
         logger.info(f'[编辑任务] 原始任务数据: task_name={old_task.task_name}, cron_expression={old_task.cron_expression}')
+        
+        # 检测主键匹配问题（如果 config_id 或 data_table_name 发生变化）
+        if page_object.type != 'status':
+            config_changed = page_object.config_id is not None and page_object.config_id != old_task.config_id
+            table_name_changed = page_object.data_table_name is not None and page_object.data_table_name != old_task.data_table_name
+            
+            if config_changed or table_name_changed:
+                # 延迟导入，避免循环导入
+                from module_tushare.dao.tushare_dao import TushareApiConfigDao, TushareDataDao
+                from sqlalchemy import text
+                from config.env import DataBaseConfig
+                
+                # 获取新接口配置
+                new_config = None
+                if config_changed and page_object.config_id:
+                    new_config = await TushareApiConfigDao.get_config_detail_by_id(query_db, page_object.config_id)
+                
+                # 确定要检查的表名
+                check_table_name = page_object.data_table_name if table_name_changed else old_task.data_table_name
+                if not check_table_name or check_table_name.strip() == '':
+                    if new_config:
+                        check_table_name = f'tushare_{new_config.api_code}'
+                    elif old_task.config_id:
+                        old_config = await TushareApiConfigDao.get_config_detail_by_id(query_db, old_task.config_id)
+                        if old_config:
+                            check_table_name = f'tushare_{old_config.api_code}'
+                
+                # 检查表是否存在
+                if check_table_name:
+                    table_exists = False
+                    if DataBaseConfig.db_type == 'postgresql':
+                        check_sql = """
+                            SELECT EXISTS (
+                                SELECT FROM information_schema.tables 
+                                WHERE table_schema = 'public' 
+                                AND table_name = :table_name
+                            )
+                        """
+                    else:
+                        check_sql = """
+                            SELECT COUNT(*) as count
+                            FROM information_schema.tables 
+                            WHERE table_schema = DATABASE()
+                            AND table_name = :table_name
+                        """
+                    
+                    result = await query_db.execute(text(check_sql), {'table_name': check_table_name})
+                    if DataBaseConfig.db_type == 'postgresql':
+                        table_exists = result.scalar()
+                    else:
+                        table_exists = result.scalar() > 0
+                    
+                    # 如果表已存在，检测主键匹配
+                    if table_exists and new_config:
+                        table_pk = await TushareDataDao.detect_unique_keys(query_db, check_table_name)
+                        config_pk = None
+                        if new_config.primary_key_fields:
+                            import json
+                            try:
+                                config_pk = json.loads(new_config.primary_key_fields)
+                                if not isinstance(config_pk, list):
+                                    config_pk = None
+                            except (json.JSONDecodeError, TypeError):
+                                config_pk = None
+                        
+                        # 如果表主键与接口配置主键不匹配，给出警告
+                        if config_pk and table_pk:
+                            # 转换为集合进行比较（忽略顺序）
+                            if set(config_pk) != set(table_pk):
+                                logger.warning(
+                                    f'[编辑任务] 表 {check_table_name} 的主键 ({table_pk}) 与接口配置的主键 ({config_pk}) 不匹配。'
+                                    f'系统将使用表实际主键进行数据更新操作。'
+                                )
+                        elif config_pk and not table_pk:
+                            logger.warning(
+                                f'[编辑任务] 接口配置了主键字段 ({config_pk})，但表 {check_table_name} 没有主键。'
+                                f'系统将使用接口配置的主键进行数据更新操作。'
+                            )
+                        elif not config_pk and table_pk:
+                            logger.info(
+                                f'[编辑任务] 表 {check_table_name} 有主键 ({table_pk})，但接口配置未指定主键字段。'
+                                f'系统将使用表实际主键进行数据更新操作。'
+                            )
         
         if page_object.type != 'status':
             check_task = TushareDownloadTaskModel(
@@ -856,23 +999,46 @@ class TushareWorkflowConfigService:
         :param page_object: 编辑流程配置对象
         :return: 编辑流程配置校验结果
         """
+        # 校验ID是否存在
+        if not page_object.workflow_id:
+            raise ServiceException(message='流程配置ID不能为空，无法执行更新操作')
+
         old_workflow = await TushareWorkflowConfigDao.get_workflow_detail_by_id(query_db, page_object.workflow_id)
         if not old_workflow:
             raise ServiceException(message='流程配置不存在')
 
+        # 如果名称发生变化，做唯一性校验，保证“不允许重名”
         if page_object.workflow_name and page_object.workflow_name != old_workflow.workflow_name:
             check_workflow = TushareWorkflowConfigModel(
-                workflowId=page_object.workflow_id, workflowName=page_object.workflow_name
+                workflowId=page_object.workflow_id,
+                workflowName=page_object.workflow_name,
             )
             if not await cls.check_workflow_unique_services(query_db, check_workflow):
                 raise ServiceException(message=f'编辑流程配置{page_object.workflow_name}失败，流程名称已存在')
 
         try:
-            edit_workflow_dict: dict[str, Any] = {}
-            cls._deal_edit_workflow(page_object, edit_workflow_dict)
-            result_id = await TushareWorkflowConfigDao.edit_workflow_dao(
-                query_db, TushareWorkflowConfigModel(**{**page_object.model_dump(), **edit_workflow_dict})
+            # 使用model_dump获取所有字段值，使用by_alias=False确保使用snake_case字段名
+            # 排除type字段，因为它只是操作类型标识，不需要保存到数据库
+            edit_workflow_dict = page_object.model_dump(
+                exclude={'type'},
+                exclude_none=False,
+                by_alias=False,
             )
+
+            # 确保workflow_id在字典中
+            workflow_id = edit_workflow_dict.get('workflow_id')
+            if workflow_id is None:
+                raise ServiceException(message='流程配置ID验证失败，edit_workflow_dict中workflow_id为None')
+
+            # 保留原有的创建信息
+            edit_workflow_dict['create_by'] = old_workflow.create_by if old_workflow.create_by else None
+            edit_workflow_dict['create_time'] = old_workflow.create_time if old_workflow.create_time else None
+
+            # 应用字段精细更新逻辑（只覆盖明确允许编辑的字段）
+            cls._deal_edit_workflow(page_object, edit_workflow_dict)
+
+            # 直接使用字典更新，避免模型对象创建时的字段映射问题
+            await TushareWorkflowConfigDao.edit_workflow_dao(query_db, workflow_id, edit_workflow_dict)
             await query_db.commit()
             result = {'is_success': True, 'message': '编辑成功'}
         except Exception as e:
@@ -908,6 +1074,24 @@ class TushareWorkflowConfigService:
         return CrudResponseModel(**result)
 
     @classmethod
+    async def workflow_base_detail_services(
+        cls, query_db: AsyncSession, workflow_id: int
+    ) -> TushareWorkflowConfigModel:
+        """
+        获取流程配置基础信息service（不包含步骤列表，主要用于前端表单编辑回显）
+
+        :param query_db: orm对象
+        :param workflow_id: 流程配置id
+        :return: 流程配置基础信息对象
+        """
+        workflow = await TushareWorkflowConfigDao.get_workflow_detail_by_id(query_db, workflow_id)
+        if not workflow:
+            return TushareWorkflowConfigModel()
+
+        workflow_model = TushareWorkflowConfigModel(**CamelCaseUtil.transform_result(workflow))
+        return workflow_model
+
+    @classmethod
     async def workflow_detail_services(
         cls, query_db: AsyncSession, workflow_id: int
     ) -> TushareWorkflowConfigWithStepsModel:
@@ -922,13 +1106,23 @@ class TushareWorkflowConfigService:
         if not workflow:
             return TushareWorkflowConfigWithStepsModel()
 
-        # 获取步骤列表
-        steps = await TushareWorkflowStepDao.get_steps_by_workflow_id(query_db, workflow_id)
-        step_models = [
-            TushareWorkflowStepModel(**CamelCaseUtil.transform_result(step)) for step in steps
-        ]
-
+        # 先构建基础流程模型
         workflow_model = TushareWorkflowConfigModel(**CamelCaseUtil.transform_result(workflow))
+
+        # 获取步骤列表，这里增加保护，避免数据库或异步环境异常导致整个详情接口直接500
+        step_models: list[TushareWorkflowStepModel] = []
+        try:
+            steps = await TushareWorkflowStepDao.get_steps_by_workflow_id(query_db, workflow_id)
+            step_models = [
+                TushareWorkflowStepModel(**CamelCaseUtil.transform_result(step)) for step in steps
+            ]
+        except Exception as e:
+            # 记录错误日志，但不影响基础流程信息返回
+            from utils.log_util import logger
+
+            logger.exception(f'获取流程 {workflow_id} 步骤列表失败: {e}')
+            step_models = []
+
         return TushareWorkflowConfigWithStepsModel(**workflow_model.model_dump(), steps=step_models)
 
 

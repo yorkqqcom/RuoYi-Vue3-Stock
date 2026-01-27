@@ -22,6 +22,7 @@ class TushareApiConfig(Base):
     api_desc = Column(Text, nullable=True, comment='接口描述')
     api_params = Column(Text, nullable=True, comment='接口参数（JSON格式）')
     data_fields = Column(Text, nullable=True, comment='数据字段（JSON格式，用于指定需要下载的字段）')
+    primary_key_fields = Column(Text, nullable=True, comment='主键字段配置（JSON格式，为空则使用默认data_id主键）')
     status = Column(CHAR(1), nullable=True, server_default='0', comment='状态（0正常 1停用）')
     create_by = Column(String(64), nullable=True, server_default="''", comment='创建者')
     create_time = Column(DateTime, nullable=True, default=datetime.now(), comment='创建时间')

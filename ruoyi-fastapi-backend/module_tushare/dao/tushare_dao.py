@@ -118,20 +118,42 @@ class TushareApiConfigDao:
         return db_config
 
     @classmethod
-    async def edit_config_dao(cls, db: AsyncSession, config: TushareApiConfigModel) -> int:
+    async def edit_config_dao(
+        cls, db: AsyncSession, config_id_or_model: int | TushareApiConfigModel, config_dict: dict[str, Any] | None = None
+    ) -> int:
         """
         编辑配置信息
 
         :param db: orm对象
-        :param config: 配置对象
+        :param config_id_or_model: 配置ID（int）或配置模型对象（TushareApiConfigModel）
+        :param config_dict: 配置字段字典（snake_case格式），当第一个参数是config_id时使用
         :return: 编辑结果
         """
+        # 支持两种调用方式：1) edit_config_dao(db, config_id, config_dict) 2) edit_config_dao(db, config_model)
+        if isinstance(config_id_or_model, TushareApiConfigModel):
+            # 旧的方式：传入模型对象
+            config = config_id_or_model
+            config_id = config.config_id
+            if config_id is None:
+                raise ValueError('config_id不能为None')
+            # 使用 by_alias=False 获取 snake_case 格式的字段名，以便与数据库字段匹配
+            # 使用 exclude_none=False 确保即使值为 None 的字段（如 primary_key_fields）也能被正确更新
+            config_dict = config.model_dump(exclude={'config_id'}, exclude_none=False, by_alias=False)
+        else:
+            # 新的方式：直接传入config_id和字典
+            config_id = config_id_or_model
+            if config_dict is None:
+                raise ValueError('当使用config_id时，必须提供config_dict参数')
+        
+        # 从字典中移除 config_id，因为它只用于 WHERE 条件
+        update_dict = {k: v for k, v in config_dict.items() if k != 'config_id'}
+        
         await db.execute(
             update(TushareApiConfig)
-            .where(TushareApiConfig.config_id == config.config_id)
-            .values(**config.model_dump(exclude={'config_id'}, exclude_none=True))
+            .where(TushareApiConfig.config_id == config_id)
+            .values(**update_dict)
         )
-        return config.config_id
+        return config_id
 
     @classmethod
     async def delete_config_dao(cls, db: AsyncSession, config_ids: Sequence[int]) -> int:
@@ -591,9 +613,216 @@ class TushareDataDao:
         return unique_keys
 
     @classmethod
+    async def get_unique_key_fields(
+        cls, db: AsyncSession, table_name: str, config=None, step_unique_key_fields: list[str] | None = None, primary_key_fields_str: str | None = None
+    ) -> list[str]:
+        """
+        获取唯一键字段，按照优先级：
+        1. 步骤配置的 unique_key_fields（节点级别）
+        2. 如果表已存在，且接口配置的主键字段也有，则优先使用接口配置的主键字段
+        3. 如果表已存在，使用表实际主键
+        4. 接口配置的 primary_key_fields（接口级别，如果表不存在）
+        5. 自动检测表的唯一键（如果表存在）
+        
+        :param db: 数据库会话
+        :param table_name: 表名
+        :param config: 接口配置对象（可选，用于向后兼容，但优先使用 primary_key_fields_str）
+        :param step_unique_key_fields: 步骤配置的唯一键字段（可选）
+        :param primary_key_fields_str: 主键字段JSON字符串（可选，优先使用此参数避免访问 config 对象）
+        :return: 唯一键字段列表
+        """
+        from sqlalchemy import text
+        from config.env import DataBaseConfig
+        from utils.log_util import logger
+        
+        # 第一优先级：步骤配置的唯一键字段
+        if step_unique_key_fields and len(step_unique_key_fields) > 0:
+            logger.debug(f'使用步骤配置的唯一键字段: {step_unique_key_fields}')
+            return step_unique_key_fields
+        
+        # 检查表是否存在
+        table_exists = False
+        if DataBaseConfig.db_type == 'postgresql':
+            check_sql = """
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_schema = 'public' 
+                    AND table_name = :table_name
+                )
+            """
+        else:
+            check_sql = """
+                SELECT COUNT(*) as count
+                FROM information_schema.tables 
+                WHERE table_schema = DATABASE()
+                AND table_name = :table_name
+            """
+        
+        result = await db.execute(text(check_sql), {'table_name': table_name})
+        if DataBaseConfig.db_type == 'postgresql':
+            table_exists = result.scalar()
+        else:
+            table_exists = result.scalar() > 0
+        
+        # 第二优先级：如果表已存在，且接口配置的主键字段也有，则优先使用接口配置的主键字段
+        # 优先使用传入的 primary_key_fields_str，避免访问 config 对象导致延迟加载
+        if table_exists and primary_key_fields_str:
+            try:
+                import json
+                config_pk_fields = json.loads(primary_key_fields_str)
+                if isinstance(config_pk_fields, list) and len(config_pk_fields) > 0:
+                    logger.debug(f'表 {table_name} 已存在，且接口配置的主键字段也有，优先使用接口配置的主键字段: {config_pk_fields}')
+                    return config_pk_fields
+            except (json.JSONDecodeError, TypeError) as e:
+                logger.warning(f'解析主键字段字符串失败: {e}')
+        
+        # 如果 primary_key_fields_str 为空，尝试从 config 对象获取（向后兼容，但可能触发延迟加载）
+        if table_exists and config and hasattr(config, 'primary_key_fields') and config.primary_key_fields:
+            try:
+                import json
+                config_pk_fields = json.loads(config.primary_key_fields)
+                if isinstance(config_pk_fields, list) and len(config_pk_fields) > 0:
+                    logger.debug(f'表 {table_name} 已存在，且接口配置的主键字段也有，优先使用接口配置的主键字段: {config_pk_fields}')
+                    return config_pk_fields
+            except (json.JSONDecodeError, TypeError) as e:
+                logger.warning(f'解析接口配置的主键字段失败: {e}')
+        
+        # 第三优先级：如果表已存在，使用表实际主键
+        if table_exists:
+            table_unique_keys = await cls.detect_unique_keys(db, table_name)
+            if table_unique_keys:
+                logger.debug(f'表 {table_name} 已存在，使用表实际主键: {table_unique_keys}')
+                return table_unique_keys
+        
+        # 第四优先级：接口配置的主键字段（如果表不存在）
+        # 优先使用传入的 primary_key_fields_str，避免访问 config 对象导致延迟加载
+        if primary_key_fields_str:
+            try:
+                import json
+                config_pk_fields = json.loads(primary_key_fields_str)
+                if isinstance(config_pk_fields, list) and len(config_pk_fields) > 0:
+                    logger.debug(f'使用接口配置的主键字段: {config_pk_fields}')
+                    return config_pk_fields
+            except (json.JSONDecodeError, TypeError) as e:
+                logger.warning(f'解析主键字段字符串失败: {e}')
+        
+        # 如果 primary_key_fields_str 为空，尝试从 config 对象获取（向后兼容，但可能触发延迟加载）
+        if config and hasattr(config, 'primary_key_fields') and config.primary_key_fields:
+            try:
+                import json
+                config_pk_fields = json.loads(config.primary_key_fields)
+                if isinstance(config_pk_fields, list) and len(config_pk_fields) > 0:
+                    logger.debug(f'使用接口配置的主键字段: {config_pk_fields}')
+                    return config_pk_fields
+            except (json.JSONDecodeError, TypeError) as e:
+                logger.warning(f'解析接口配置的主键字段失败: {e}')
+        
+        # 第五优先级：自动检测表的唯一键（如果表存在）
+        if table_exists:
+            auto_detected = await cls.detect_unique_keys(db, table_name)
+            if auto_detected:
+                logger.debug(f'自动检测到表的唯一键: {auto_detected}')
+                return auto_detected
+        
+        # 如果都没有，返回空列表
+        logger.warning(f'未找到表 {table_name} 的唯一键字段')
+        return []
+
+    @classmethod
+    async def _check_unique_constraint_exists(cls, db: AsyncSession, table_name: str, columns: list[str]) -> bool:
+        """
+        检查表是否有指定列的唯一约束
+        
+        :param db: 数据库会话
+        :param table_name: 表名
+        :param columns: 列名列表
+        :return: 是否存在唯一约束
+        """
+        from sqlalchemy import text
+        from config.env import DataBaseConfig
+        from utils.log_util import logger
+        
+        if not columns or len(columns) == 0:
+            return False
+        
+        try:
+            if DataBaseConfig.db_type == 'postgresql':
+                # PostgreSQL: 检查唯一约束或唯一索引
+                # 方法：检查约束的列名是否完全匹配（不区分顺序）
+                columns_sorted = sorted(columns)
+                
+                # 构建列名数组的字符串表示（用于 SQL 比较）
+                # 注意：这里使用字符串拼接是因为 PostgreSQL 数组字面量需要特殊格式
+                columns_array_str = '{' + ','.join([f'"{col}"' for col in columns_sorted]) + '}'
+                
+                # 查询所有唯一约束，然后检查列名是否匹配
+                # 使用 f-string 是因为 PostgreSQL 数组字面量不能通过参数绑定
+                check_sql = f"""
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_constraint c
+                        JOIN pg_class t ON c.conrelid = t.oid
+                        JOIN pg_namespace n ON t.relnamespace = n.oid
+                        WHERE n.nspname = 'public'
+                        AND t.relname = :table_name
+                        AND c.contype = 'u'
+                        AND array_length(c.conkey, 1) = :col_count
+                        AND (
+                            SELECT array_agg(a.attname::text ORDER BY a.attname)
+                            FROM pg_attribute a
+                            WHERE a.attrelid = c.conrelid
+                            AND a.attnum = ANY(c.conkey)
+                        ) = '{columns_array_str}'::text[]
+                    )
+                """
+                
+                result = await db.execute(
+                    text(check_sql),
+                    {
+                        'table_name': table_name,
+                        'col_count': len(columns)
+                    }
+                )
+                exists = result.scalar()
+                result_bool = bool(exists) if exists is not None else False
+                logger.debug(f'表 {table_name} 唯一约束检查: 字段 {columns} -> {result_bool}')
+                return result_bool
+            else:
+                # MySQL: 检查唯一索引
+                check_sql = """
+                    SELECT COUNT(*) > 0
+                    FROM information_schema.statistics
+                    WHERE table_schema = DATABASE()
+                    AND table_name = :table_name
+                    AND index_name IN (
+                        SELECT index_name
+                        FROM information_schema.statistics
+                        WHERE table_schema = DATABASE()
+                        AND table_name = :table_name
+                        AND non_unique = 0
+                        GROUP BY index_name
+                        HAVING COUNT(*) = :col_count
+                        AND GROUP_CONCAT(column_name ORDER BY seq_in_index) = :columns
+                    )
+                """
+                columns_str = ','.join(columns)
+                result = await db.execute(
+                    text(check_sql),
+                    {
+                        'table_name': table_name,
+                        'col_count': len(columns),
+                        'columns': columns_str
+                    }
+                )
+                return result.scalar() > 0
+        except Exception as e:
+            logger.warning(f'检查表 {table_name} 的唯一约束时出错: {e}，假设不存在')
+            return False
+
+    @classmethod
     async def add_dataframe_to_table_dao(
         cls, db: AsyncSession, table_name: str, df: pd.DataFrame, task_id: int, config_id: int, api_code: str, download_date: str,
-        update_mode: str = '0', unique_key_fields: list[str] | None = None
+        update_mode: str = '0', unique_key_fields: list[str] | None = None, config=None, primary_key_fields_str: str | None = None
     ) -> int:
         """
         将 DataFrame 批量插入到指定表（表结构与 DataFrame 列一致）
@@ -612,6 +841,8 @@ class TushareDataDao:
         :param download_date: 下载日期
         :param update_mode: 更新方式（'0': INSERT, '1': INSERT_IGNORE, '2': UPSERT, '3': DELETE_INSERT）
         :param unique_key_fields: 唯一键字段列表（如果为None，则自动检测）
+        :param config: 接口配置对象（可选，用于向后兼容，但优先使用 primary_key_fields_str）
+        :param primary_key_fields_str: 主键字段JSON字符串（可选，优先使用此参数避免访问 config 对象）
         :return: 插入的记录数
         """
         from sqlalchemy import text
@@ -643,14 +874,23 @@ class TushareDataDao:
         
         all_columns = system_columns + df_columns
 
-        # 确定唯一键字段
+        # 确定唯一键字段（使用新的优先级逻辑）
+        # 传递提前提取的 primary_key_fields_str，避免访问 config 对象导致延迟加载
         if unique_key_fields is None or len(unique_key_fields) == 0:
-            # 自动检测唯一键
-            unique_key_fields = await cls.detect_unique_keys(db, table_name)
+            unique_key_fields = await cls.get_unique_key_fields(db, table_name, config=config, step_unique_key_fields=None, primary_key_fields_str=primary_key_fields_str)
             if unique_key_fields:
-                logger.info(f'自动检测到表 {table_name} 的唯一键字段: {unique_key_fields}')
+                logger.info(f'获取到表 {table_name} 的唯一键字段: {unique_key_fields}')
             else:
-                logger.warning(f'表 {table_name} 未检测到唯一键字段，某些更新模式可能无法正常工作')
+                logger.warning(f'表 {table_name} 未找到唯一键字段，某些更新模式可能无法正常工作')
+
+        # 验证唯一键字段是否都存在于 all_columns 中
+        if unique_key_fields:
+            invalid_fields = [field for field in unique_key_fields if field not in all_columns]
+            if invalid_fields:
+                logger.warning(f'唯一键字段 {invalid_fields} 不在表的列中，将从唯一键字段列表中移除')
+                unique_key_fields = [field for field in unique_key_fields if field in all_columns]
+                if not unique_key_fields:
+                    logger.warning(f'所有唯一键字段都无效，某些更新模式可能无法正常工作')
 
         # 如果 update_mode 是 '2' (UPSERT) 或 '3' (DELETE_INSERT)，需要唯一键
         if update_mode in ['2', '3'] and not unique_key_fields:
@@ -705,13 +945,40 @@ class TushareDataDao:
             if DataBaseConfig.db_type == 'postgresql':
                 # PostgreSQL: ON CONFLICT DO NOTHING
                 if unique_key_fields:
-                    # 需要指定冲突的列
-                    conflict_cols = ', '.join([f'"{col}"' for col in unique_key_fields])
-                    col_names = ', '.join([f'"{col}"' for col in all_columns])
-                    placeholders = ', '.join([f':{col}' for col in all_columns])
-                    insert_sql = f'INSERT INTO "{table_name}" ({col_names}) VALUES ({placeholders}) ON CONFLICT ({conflict_cols}) DO NOTHING'
+                    # 检查表是否有对应的唯一约束
+                    logger.debug(f'检查表 {table_name} 在字段 {unique_key_fields} 上是否有唯一约束')
+                    has_unique_constraint = await cls._check_unique_constraint_exists(db, table_name, unique_key_fields)
+                    logger.debug(f'表 {table_name} 唯一约束检查结果: {has_unique_constraint}')
+                    
+                    if not has_unique_constraint:
+                        logger.warning(
+                            f'表 {table_name} 在字段 {unique_key_fields} 上没有唯一约束，'
+                            f'无法使用 ON CONFLICT。将使用普通 INSERT 模式（可能因重复数据报错）'
+                        )
+                        # 降级为普通 INSERT
+                        col_names = ', '.join([f'"{col}"' for col in all_columns])
+                        placeholders = ', '.join([f':{col}' for col in all_columns])
+                        insert_sql = f'INSERT INTO "{table_name}" ({col_names}) VALUES ({placeholders})'
+                    else:
+                        # 记录尝试插入的数据的唯一键值（用于日志）
+                        if values_list and len(values_list) > 0:
+                            sample_keys = []
+                            for i, row_dict in enumerate(values_list[:5]):  # 只记录前5条
+                                key_values = {k: row_dict.get(k) for k in unique_key_fields if k in row_dict}
+                                if key_values:
+                                    sample_keys.append(key_values)
+                            if sample_keys:
+                                logger.debug(f'尝试插入数据到表 {table_name}，唯一键字段: {unique_key_fields}，示例数据: {sample_keys}')
+                        
+                        # 需要指定冲突的列
+                        conflict_cols = ', '.join([f'"{col}"' for col in unique_key_fields])
+                        col_names = ', '.join([f'"{col}"' for col in all_columns])
+                        placeholders = ', '.join([f':{col}' for col in all_columns])
+                        insert_sql = f'INSERT INTO "{table_name}" ({col_names}) VALUES ({placeholders}) ON CONFLICT ({conflict_cols}) DO NOTHING'
+                        logger.debug(f'使用 ON CONFLICT 模式，冲突列: {conflict_cols}')
                 else:
                     # 如果没有唯一键，使用普通 INSERT（PostgreSQL 没有 INSERT IGNORE）
+                    logger.warning(f'表 {table_name} 没有唯一键字段，INSERT_IGNORE 模式将使用普通 INSERT')
                     col_names = ', '.join([f'"{col}"' for col in all_columns])
                     placeholders = ', '.join([f':{col}' for col in all_columns])
                     insert_sql = f'INSERT INTO "{table_name}" ({col_names}) VALUES ({placeholders})'
@@ -721,14 +988,64 @@ class TushareDataDao:
                 placeholders = ', '.join([f':{col}' for col in all_columns])
                 insert_sql = f'INSERT IGNORE INTO `{table_name}` ({col_names}) VALUES ({placeholders})'
             
-            result = await db.execute(text(insert_sql), values_list)
-            await db.flush()
-            return result.rowcount if hasattr(result, 'rowcount') else len(values_list)
+            total_rows = len(values_list)
+            try:
+                result = await db.execute(text(insert_sql), values_list)
+                await db.flush()
+                inserted_rows = result.rowcount if hasattr(result, 'rowcount') and result.rowcount is not None else total_rows
+            except Exception as insert_error:
+                # 如果 INSERT 失败（可能是因为没有唯一约束但使用了 ON CONFLICT），降级为普通 INSERT
+                error_msg = str(insert_error)
+                if 'ON CONFLICT' in insert_sql and ('没有匹配ON CONFLICT说明的唯一或者排除约束' in error_msg or 'no matching unique or exclusion constraint' in error_msg.lower()):
+                    logger.warning(
+                        f'表 {table_name} 使用 ON CONFLICT 失败（表上可能没有唯一约束），'
+                        f'降级为普通 INSERT 模式重试'
+                    )
+                    # 降级为普通 INSERT
+                    col_names = ', '.join([f'"{col}"' for col in all_columns])
+                    placeholders = ', '.join([f':{col}' for col in all_columns])
+                    insert_sql = f'INSERT INTO "{table_name}" ({col_names}) VALUES ({placeholders})'
+                    result = await db.execute(text(insert_sql), values_list)
+                    await db.flush()
+                    inserted_rows = len(values_list)
+                else:
+                    # 其他错误，直接抛出
+                    raise
+            
+            # 记录冲突统计
+            if unique_key_fields and total_rows > inserted_rows:
+                skipped_count = total_rows - inserted_rows
+                logger.warning(f'表 {table_name} INSERT_IGNORE 模式：尝试插入 {total_rows} 条，实际插入 {inserted_rows} 条，跳过 {skipped_count} 条重复数据（唯一键: {unique_key_fields}）')
+                
+                # 如果跳过的数据较多，记录更多详细信息
+                if skipped_count > 0 and values_list:
+                    # 记录所有唯一键值，帮助用户识别重复数据
+                    all_key_values = []
+                    for row_dict in values_list:
+                        key_values = {k: row_dict.get(k) for k in unique_key_fields if k in row_dict}
+                        if key_values:
+                            all_key_values.append(key_values)
+                    
+                    # 记录前10条唯一键值
+                    sample_count = min(10, len(all_key_values))
+                    logger.debug(f'表 {table_name} 尝试插入的数据的唯一键值（前{sample_count}条）: {all_key_values[:sample_count]}')
+            
+            return inserted_rows
 
         elif update_mode == '2':
             # UPSERT: 存在则更新，不存在则插入
             if not unique_key_fields:
                 raise ValueError('UPSERT 模式需要唯一键字段')
+            
+            # 记录尝试插入的数据的唯一键值（用于日志）
+            if values_list and len(values_list) > 0:
+                sample_keys = []
+                for i, row_dict in enumerate(values_list[:5]):  # 只记录前5条
+                    key_values = {k: row_dict.get(k) for k in unique_key_fields if k in row_dict}
+                    if key_values:
+                        sample_keys.append(key_values)
+                if sample_keys:
+                    logger.debug(f'尝试 UPSERT 数据到表 {table_name}，唯一键字段: {unique_key_fields}，示例数据: {sample_keys}')
             
             if DataBaseConfig.db_type == 'postgresql':
                 # PostgreSQL: ON CONFLICT DO UPDATE
@@ -748,9 +1065,14 @@ class TushareDataDao:
                 update_set = ', '.join([f'`{col}` = VALUES(`{col}`)' for col in update_cols])
                 insert_sql = f'INSERT INTO `{table_name}` ({col_names}) VALUES ({placeholders}) ON DUPLICATE KEY UPDATE {update_set}'
             
+            total_rows = len(values_list)
             result = await db.execute(text(insert_sql), values_list)
             await db.flush()
-            return len(values_list)
+            
+            # 对于 UPSERT，PostgreSQL 不直接返回插入/更新的行数，但我们可以记录
+            logger.info(f'表 {table_name} UPSERT 模式：处理 {total_rows} 条数据（唯一键: {unique_key_fields}），已存在的数据将被更新，不存在的数据将被插入')
+            
+            return total_rows
 
         elif update_mode == '3':
             # DELETE_INSERT: 先删除再插入
@@ -1041,20 +1363,44 @@ class TushareWorkflowConfigDao:
         return db_workflow
 
     @classmethod
-    async def edit_workflow_dao(cls, db: AsyncSession, workflow: TushareWorkflowConfigModel) -> int:
+    async def edit_workflow_dao(
+        cls,
+        db: AsyncSession,
+        workflow_id_or_model: int | TushareWorkflowConfigModel,
+        workflow_dict: dict[str, Any] | None = None,
+    ) -> int:
         """
         编辑流程信息
 
         :param db: orm对象
-        :param workflow: 流程对象
+        :param workflow_id_or_model: 流程ID（int）或流程模型对象（TushareWorkflowConfigModel）
+        :param workflow_dict: 流程字段字典（snake_case格式），当第一个参数是workflow_id时使用
         :return: 编辑结果
         """
+        # 兼容两种调用方式：
+        # 1) edit_workflow_dao(db, workflow_model)
+        # 2) edit_workflow_dao(db, workflow_id, workflow_dict)
+        if isinstance(workflow_id_or_model, TushareWorkflowConfigModel):
+            workflow = workflow_id_or_model
+            workflow_id = workflow.workflow_id
+            if workflow_id is None:
+                raise ValueError('workflow_id不能为None')
+            # 使用 by_alias=False 获取 snake_case 字段名，exclude_none=True 只更新有值的字段
+            workflow_dict = workflow.model_dump(exclude={'workflow_id'}, exclude_none=True, by_alias=False)
+        else:
+            workflow_id = workflow_id_or_model
+            if workflow_dict is None:
+                raise ValueError('当使用workflow_id时，必须提供workflow_dict参数')
+
+        # 从字典中移除 workflow_id，因为它只用于 WHERE 条件
+        update_dict = {k: v for k, v in workflow_dict.items() if k != 'workflow_id'}
+
         await db.execute(
             update(TushareWorkflowConfig)
-            .where(TushareWorkflowConfig.workflow_id == workflow.workflow_id)
-            .values(**workflow.model_dump(exclude={'workflow_id'}, exclude_none=True))
+            .where(TushareWorkflowConfig.workflow_id == workflow_id)
+            .values(**update_dict)
         )
-        return workflow.workflow_id
+        return workflow_id
 
     @classmethod
     async def delete_workflow_dao(cls, db: AsyncSession, workflow_ids: Sequence[int]) -> int:

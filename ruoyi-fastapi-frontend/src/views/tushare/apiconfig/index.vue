@@ -121,6 +121,10 @@
       <!-- 添加或修改接口配置对话框 -->
       <el-dialog :title="title" v-model="open" width="900px" append-to-body>
          <el-form ref="apiConfigRef" :model="form" :rules="rules" label-width="120px">
+            <!-- 隐藏字段：确保configId被包含在表单中 -->
+            <el-form-item v-if="form.configId" style="display: none;">
+               <el-input v-model="form.configId" type="hidden" />
+            </el-form-item>
             <el-row>
                <el-col :span="24">
                   <el-form-item label="接口名称" prop="apiName">
@@ -165,6 +169,27 @@
                      <div style="color: #909399; font-size: 12px; margin-top: 5px;">
                         格式：JSON数组，例如：["ts_code", "symbol", "name"]<br/>
                         留空则下载所有字段
+                     </div>
+                  </el-form-item>
+               </el-col>
+               <el-col :span="24">
+                  <el-form-item label="主键字段" prop="primaryKeyFields">
+                     <el-input 
+                        v-model="form.primaryKeyFields" 
+                        type="textarea" 
+                        :rows="3" 
+                        placeholder='请输入JSON数组格式的主键字段列表，如：["ts_code", "trade_date"]'
+                     />
+                     <div style="color: #909399; font-size: 12px; margin-top: 5px;">
+                        <div><strong>主键字段说明：</strong></div>
+                        <div>• 格式：JSON数组，例如：["ts_code", "trade_date"]（支持复合主键）</div>
+                        <div>• 留空则使用默认主键 data_id（自增ID）</div>
+                        <div>• 主键字段必须存在于数据字段中</div>
+                        <div>• 创建新表时会使用配置的主键字段创建复合主键</div>
+                        <div>• 已存在的表会继续使用原有主键，不受此配置影响</div>
+                        <div style="margin-top: 5px; color: #E6A23C;">
+                           <strong>注意：</strong>如果表已存在，系统会优先使用表实际主键，而不是接口配置的主键字段
+                        </div>
                      </div>
                   </el-form-item>
                </el-col>
@@ -261,6 +286,29 @@ const data = reactive({
         },
         trigger: "blur"
       }
+    ],
+    primaryKeyFields: [
+      {
+        validator: (rule, value, callback) => {
+          if (value && value.trim()) {
+            try {
+              const parsed = JSON.parse(value);
+              if (!Array.isArray(parsed)) {
+                callback(new Error("主键字段必须是JSON数组格式"));
+              } else if (parsed.length === 0) {
+                callback(new Error("主键字段数组不能为空"));
+              } else {
+                callback();
+              }
+            } catch (e) {
+              callback(new Error("主键字段必须是有效的JSON数组格式"));
+            }
+          } else {
+            callback();
+          }
+        },
+        trigger: "blur"
+      }
     ]
   }
 });
@@ -292,6 +340,7 @@ function reset() {
     apiDesc: undefined,
     apiParams: undefined,
     dataFields: undefined,
+    primaryKeyFields: undefined,
     status: "0",
     remark: undefined
   };
@@ -340,10 +389,26 @@ function handleAdd() {
 function handleUpdate(row) {
   reset();
   const configId = row.configId || ids.value[0];
+  if (!configId) {
+    proxy.$modal.msgError("请选择要修改的接口配置");
+    return;
+  }
   getApiConfig(configId).then(response => {
     form.value = response.data;
+    // 确保configId被正确设置
+    if (!form.value.configId) {
+      form.value.configId = configId;
+    }
+    // 处理主键字段：如果为null或undefined，转换为空字符串，确保在文本框中正确显示
+    if (form.value.primaryKeyFields === null || form.value.primaryKeyFields === undefined) {
+      form.value.primaryKeyFields = '';
+    }
+    console.log('修改接口配置，获取到的数据:', form.value);
     open.value = true;
     title.value = "修改接口配置";
+  }).catch(error => {
+    console.error('获取接口配置详情失败:', error);
+    proxy.$modal.msgError("获取接口配置详情失败");
   });
 }
 
@@ -351,17 +416,40 @@ function handleUpdate(row) {
 function submitForm() {
   proxy.$refs["apiConfigRef"].validate(valid => {
     if (valid) {
-      if (form.value.configId != undefined) {
-        updateApiConfig(form.value).then(response => {
+      // 确保主键字段总是被发送，即使是undefined也转换为空字符串
+      const submitData = { ...form.value };
+      if (submitData.primaryKeyFields === undefined || submitData.primaryKeyFields === null) {
+        submitData.primaryKeyFields = '';
+      }
+      
+      // 确保configId被正确传递（修改时必须包含configId）
+      const configId = form.value.configId;
+      console.log('提交表单，form.value:', form.value);
+      console.log('提交表单，configId:', configId, '类型:', typeof configId);
+      
+      if (configId != undefined && configId != null && configId !== '') {
+        // 修改操作：确保configId被包含在提交数据中
+        submitData.configId = configId;
+        console.log('修改接口配置，configId:', submitData.configId, '提交数据:', JSON.stringify(submitData, null, 2));
+        updateApiConfig(submitData).then(response => {
           proxy.$modal.msgSuccess("修改成功");
           open.value = false;
           getList();
+        }).catch(error => {
+          console.error('修改接口配置失败:', error);
+          proxy.$modal.msgError("修改失败：" + (error.response?.data?.msg || error.message || '未知错误'));
         });
       } else {
-        addApiConfig(form.value).then(response => {
+        // 新增操作：确保不包含configId
+        delete submitData.configId;
+        console.log('新增接口配置，提交数据:', JSON.stringify(submitData, null, 2));
+        addApiConfig(submitData).then(response => {
           proxy.$modal.msgSuccess("新增成功");
           open.value = false;
           getList();
+        }).catch(error => {
+          console.error('新增接口配置失败:', error);
+          proxy.$modal.msgError("新增失败：" + (error.response?.data?.msg || error.message || '未知错误'));
         });
       }
     }

@@ -19,6 +19,7 @@ class TushareApiConfigModel(BaseModel):
     api_desc: str | None = Field(default=None, description='接口描述')
     api_params: str | None = Field(default=None, description='接口参数（JSON格式）')
     data_fields: str | None = Field(default=None, description='数据字段（JSON格式）')
+    primary_key_fields: str | None = Field(default=None, description='主键字段配置（JSON格式，为空则使用默认data_id主键）')
     status: Literal['0', '1'] | None = Field(default=None, description='状态（0正常 1停用）')
     create_by: str | None = Field(default=None, description='创建者')
     create_time: datetime | None = Field(default=None, description='创建时间')

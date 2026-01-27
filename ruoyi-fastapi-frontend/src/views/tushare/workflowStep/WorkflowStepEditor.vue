@@ -216,6 +216,8 @@ async function loadWorkflowData() {
               conditionExpr: node.data?.conditionExpr !== undefined ? node.data.conditionExpr : (stepData?.conditionExpr || null),
               dataTableName: node.data?.dataTableName || stepData?.dataTableName || '',
               loopMode: node.data?.loopMode !== undefined ? node.data.loopMode : (stepData?.loopMode || '0'),
+              updateMode: node.data?.updateMode !== undefined ? node.data.updateMode : (stepData?.updateMode || '0'),
+              uniqueKeyFields: node.data?.uniqueKeyFields !== undefined ? node.data.uniqueKeyFields : (stepData?.uniqueKeyFields || null),
               apiConfigs: apiConfigs.value
             }
           }
@@ -253,6 +255,8 @@ async function loadWorkflowData() {
           conditionExpr: step.conditionExpr,
           dataTableName: step.dataTableName || '',
           loopMode: step.loopMode || '0',
+          updateMode: step.updateMode || '0',
+          uniqueKeyFields: step.uniqueKeyFields || null,
           apiConfigs: apiConfigs.value
         }
       }
@@ -354,6 +358,8 @@ function addNode(type, position) {
         conditionExpr: null,
         dataTableName: '',
         loopMode: '0',
+        updateMode: '0',
+        uniqueKeyFields: null,
         apiConfigs: apiConfigs.value
       }
 
@@ -606,6 +612,8 @@ async function handleSave() {
         conditionExpr: node.data.conditionExpr || null,
         dataTableName: node.data.dataTableName || null,
         loopMode: node.data.loopMode || '0',
+        updateMode: node.data.updateMode || '0',
+        uniqueKeyFields: node.data.uniqueKeyFields || null,
         positionX: Math.round(node.position.x),
         positionY: Math.round(node.position.y),
         nodeType: node.type || 'task',
@@ -627,7 +635,9 @@ async function handleSave() {
               stepParams: n.data.stepParams || null,
               conditionExpr: n.data.conditionExpr || null,
               dataTableName: n.data.dataTableName || '',
-              loopMode: n.data.loopMode || '0'
+              loopMode: n.data.loopMode || '0',
+              updateMode: n.data.updateMode || '0',
+              uniqueKeyFields: n.data.uniqueKeyFields || null
             }
           })),
           edges: edges.value.map(e => ({

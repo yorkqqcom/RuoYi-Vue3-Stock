@@ -66,16 +66,6 @@
                v-hasPermi="['tushare:workflowStep:edit']"
             >可视化编辑</el-button>
          </el-col>
-         <el-col :span="1.5">
-            <el-button
-               type="info"
-               plain
-               icon="Setting"
-               @click="handleManageSteps"
-               :disabled="single"
-               v-hasPermi="['tushare:workflowStep:list']"
-            >管理步骤</el-button>
-         </el-col>
          <right-toolbar v-model:showSearch="showSearch" @queryTable="getList"></right-toolbar>
       </el-row>
 
@@ -106,9 +96,6 @@
                </el-tooltip>
                <el-tooltip content="可视化编辑" placement="top">
                   <el-button link type="success" icon="EditPen" @click="handleVisualEdit(scope.row)" v-hasPermi="['tushare:workflowStep:edit']"></el-button>
-               </el-tooltip>
-               <el-tooltip content="管理步骤" placement="top">
-                  <el-button link type="info" icon="Setting" @click="handleManageSteps(scope.row)" v-hasPermi="['tushare:workflowStep:list']"></el-button>
                </el-tooltip>
                <el-tooltip content="修改" placement="top">
                   <el-button link type="primary" icon="Edit" @click="handleUpdate(scope.row)" v-hasPermi="['tushare:workflowConfig:edit']"></el-button>
@@ -224,11 +211,9 @@
 </template>
 
 <script setup name="WorkflowConfig">
-import { listWorkflowConfig, getWorkflowConfig, delWorkflowConfig, addWorkflowConfig, updateWorkflowConfig } from "@/api/tushare/workflowConfig"
+import { listWorkflowConfig, getWorkflowConfig, getWorkflowConfigBase, delWorkflowConfig, addWorkflowConfig, updateWorkflowConfig } from "@/api/tushare/workflowConfig"
 import WorkflowStepEditor from '../workflowStep/WorkflowStepEditor.vue'
-import { useRouter } from 'vue-router'
 
-const router = useRouter()
 const { proxy } = getCurrentInstance();
 const { sys_normal_disable } = proxy.useDict("sys_normal_disable");
 
@@ -280,13 +265,14 @@ function cancel() {
 
 /** 表单重置 */
 function reset() {
-  form.value = {
+  // 使用属性赋值而不是整体替换，避免丢失响应式引用
+  Object.assign(form.value, {
     workflowId: undefined,
     workflowName: undefined,
     workflowDesc: undefined,
     status: "0",
     remark: undefined
-  };
+  });
   proxy.resetForm("workflowConfigRef");
 }
 
@@ -336,8 +322,16 @@ function handleAdd() {
 function handleUpdate(row) {
   reset();
   const workflowId = row.workflowId || ids.value[0];
-  getWorkflowConfig(workflowId).then(response => {
-    form.value = response.data;
+  // 使用基础信息接口，避免加载步骤列表时可能出现的后端异常
+  getWorkflowConfigBase(workflowId).then(response => {
+    // 接口返回的是 { code, msg, data }，这里取内层 data
+    const data = response.data || response;
+    // 显式拷贝字段，确保与表单模型字段一一对应并保持响应式
+    form.value.workflowId = data.workflowId;
+    form.value.workflowName = data.workflowName;
+    form.value.workflowDesc = data.workflowDesc;
+    form.value.status = data.status ?? "0";
+    form.value.remark = data.remark;
     open.value = true;
     title.value = "修改流程配置";
   });
@@ -347,7 +341,8 @@ function handleUpdate(row) {
 function handleView(row) {
   const workflowId = row.workflowId || ids.value[0];
   getWorkflowConfig(workflowId).then(response => {
-    workflowDetail.value = response.data;
+    // 同样兼容 { code, msg, data } 或直接返回数据两种情况
+    workflowDetail.value = response.data || response;
     detailOpen.value = true;
   });
 }
@@ -361,15 +356,6 @@ function handleVisualEdit(row) {
   }
   currentWorkflowId.value = workflowId;
   editorOpen.value = true;
-}
-
-/** 管理步骤 */
-function handleManageSteps(row) {
-  const workflowId = row.workflowId || ids.value[0];
-  router.push({
-    path: '/tushare/workflowStep',
-    query: { workflowId: workflowId }
-  });
 }
 
 /** 编辑器保存 */

@@ -17,6 +17,14 @@ export function getWorkflowConfig(workflowId) {
   })
 }
 
+// 查询Tushare流程配置基础信息（不包含步骤列表），用于编辑表单回显
+export function getWorkflowConfigBase(workflowId) {
+  return request({
+    url: '/tushare/workflowConfig/base/' + workflowId,
+    method: 'get'
+  })
+}
+
 // 新增Tushare流程配置
 export function addWorkflowConfig(data) {
   return request({

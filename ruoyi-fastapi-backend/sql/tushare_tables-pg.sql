@@ -13,6 +13,7 @@ create table tushare_api_config (
   api_desc            text,
   api_params          text,
   data_fields         text,
+  primary_key_fields  text,
   status              char(1)        default '0',
   create_by           varchar(64)     default '',
   create_time         timestamp(0),
@@ -28,6 +29,7 @@ comment on column tushare_api_config.api_code is '接口代码（如：stock_bas
 comment on column tushare_api_config.api_desc is '接口描述';
 comment on column tushare_api_config.api_params is '接口参数（JSON格式）';
 comment on column tushare_api_config.data_fields is '数据字段（JSON格式，用于指定需要下载的字段）';
+comment on column tushare_api_config.primary_key_fields is '主键字段配置（JSON格式，为空则使用默认data_id主键）';
 comment on column tushare_api_config.status is '状态（0正常 1停用）';
 comment on column tushare_api_config.create_by is '创建者';
 comment on column tushare_api_config.create_time is '创建时间';
@@ -210,6 +212,9 @@ create table tushare_workflow_step (
   target_step_ids      text,
   layout_data          jsonb,
   data_table_name      varchar(100),
+  loop_mode            char(1)        default '0',
+  update_mode          char(1)        default '0',
+  unique_key_fields    text,
   status               char(1)        default '0',
   create_by            varchar(64)    default '',
   create_time          timestamp(0),
@@ -235,6 +240,9 @@ comment on column tushare_workflow_step.source_step_ids is '前置步骤ID列表
 comment on column tushare_workflow_step.target_step_ids is '后置步骤ID列表（JSON格式，支持多个后置节点）';
 comment on column tushare_workflow_step.layout_data is '完整的布局数据（JSONB格式，存储节点位置、连接线等可视化信息）';
 comment on column tushare_workflow_step.data_table_name is '数据存储表名（为空则使用任务配置的表名或默认表名）';
+comment on column tushare_workflow_step.loop_mode is '遍历模式（0否 1是，开启后所有变量参数都会遍历）';
+comment on column tushare_workflow_step.update_mode is '数据更新方式（0仅插入 1忽略重复 2存在则更新 3先删除再插入）';
+comment on column tushare_workflow_step.unique_key_fields is '唯一键字段配置（JSON格式，为空则自动检测）';
 comment on column tushare_workflow_step.status is '状态（0正常 1停用）';
 comment on column tushare_workflow_step.create_by is '创建者';
 comment on column tushare_workflow_step.create_time is '创建时间';

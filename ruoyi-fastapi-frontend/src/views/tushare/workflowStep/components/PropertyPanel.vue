@@ -89,6 +89,46 @@
           </div>
         </el-form-item>
 
+        <el-form-item label="数据更新方式" v-if="formData.nodeType === 'task'">
+          <el-select 
+            v-model="formData.updateMode" 
+            placeholder="请选择数据更新方式"
+            @change="handleUpdate"
+          >
+            <el-option label="仅插入（遇到重复会报错）" value="0" />
+            <el-option label="忽略重复（静默跳过）" value="1" />
+            <el-option label="存在则更新，不存在则插入" value="2" />
+            <el-option label="先删除再插入（全量替换）" value="3" />
+          </el-select>
+          <div style="color: #909399; font-size: 12px; margin-top: 5px;">
+            <div><strong>更新方式说明：</strong></div>
+            <div>• <strong>仅插入</strong>：直接插入数据，遇到重复键会报错</div>
+            <div>• <strong>忽略重复</strong>：遇到重复数据时静默跳过，不报错</div>
+            <div>• <strong>存在则更新</strong>：如果数据已存在（根据唯一键判断），则更新；不存在则插入</div>
+            <div>• <strong>先删除再插入</strong>：先删除匹配的记录，再插入新数据，用于全量替换</div>
+            <div style="margin-top: 5px; color: #E6A23C;">
+              <strong>注意：</strong>后两种模式需要唯一键字段，如果未配置则自动检测表的主键或唯一索引
+            </div>
+          </div>
+        </el-form-item>
+
+        <el-form-item label="唯一键字段" v-if="formData.nodeType === 'task'">
+          <el-input
+            v-model="formData.uniqueKeyFields"
+            type="textarea"
+            :rows="2"
+            placeholder='请输入JSON格式的唯一键字段数组，例如：["ts_code", "trade_date"]&#10;留空则自动检测表的主键或唯一索引'
+            @blur="handleUpdate"
+          />
+          <div style="color: #909399; font-size: 12px; margin-top: 5px;">
+            <div><strong>唯一键字段说明：</strong></div>
+            <div>• 用于判断数据是否重复的字段组合</div>
+            <div>• 格式：JSON数组，例如：["ts_code", "trade_date"]</div>
+            <div>• 留空则自动检测表的主键或唯一索引</div>
+            <div>• 仅在"存在则更新"和"先删除再插入"模式下需要</div>
+          </div>
+        </el-form-item>
+
         <el-form-item label="位置坐标">
           <el-row :gutter="8">
             <el-col :span="12">
@@ -164,6 +204,16 @@ const formData = ref({})
 // 初始化表单数据
 watch(() => props.element, (newElement) => {
   if (props.elementType === 'node') {
+    // 处理唯一键字段：如果是对象，转换为JSON字符串；如果是字符串，直接使用
+    let uniqueKeyFields = newElement.data?.uniqueKeyFields || ''
+    if (uniqueKeyFields && typeof uniqueKeyFields === 'object') {
+      try {
+        uniqueKeyFields = JSON.stringify(uniqueKeyFields)
+      } catch (e) {
+        uniqueKeyFields = ''
+      }
+    }
+    
     formData.value = {
       stepName: newElement.data?.stepName || '',
       nodeType: newElement.type || 'task',
@@ -172,6 +222,8 @@ watch(() => props.element, (newElement) => {
       conditionExpr: newElement.data?.conditionExpr || '',
       dataTableName: newElement.data?.dataTableName || '',
       loopMode: newElement.data?.loopMode || '0',
+      updateMode: newElement.data?.updateMode || '0',
+      uniqueKeyFields: uniqueKeyFields,
       positionX: Math.round(newElement.position?.x || 0),
       positionY: Math.round(newElement.position?.y || 0)
     }
@@ -185,13 +237,31 @@ watch(() => props.element, (newElement) => {
 // 更新属性
 function handleUpdate() {
   if (props.elementType === 'node') {
+    // 验证唯一键字段格式
+    let uniqueKeyFields = formData.value.uniqueKeyFields || ''
+    if (uniqueKeyFields && uniqueKeyFields.trim()) {
+      try {
+        const parsed = JSON.parse(uniqueKeyFields)
+        if (!Array.isArray(parsed)) {
+          throw new Error('唯一键字段必须是JSON数组格式')
+        }
+        // 验证通过，保持原值
+      } catch (e) {
+        // 格式错误，清空或提示
+        console.warn('唯一键字段格式错误，将使用空值:', e)
+        uniqueKeyFields = ''
+      }
+    }
+    
     const updates = {
       stepName: formData.value.stepName,
       configId: formData.value.configId,
       stepParams: formData.value.stepParams,
       conditionExpr: formData.value.conditionExpr,
       dataTableName: formData.value.dataTableName,
-      loopMode: formData.value.loopMode
+      loopMode: formData.value.loopMode,
+      updateMode: formData.value.updateMode,
+      uniqueKeyFields: uniqueKeyFields
     }
     
     // 更新位置

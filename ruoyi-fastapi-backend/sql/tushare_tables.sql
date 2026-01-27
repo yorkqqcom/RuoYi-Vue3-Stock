@@ -13,6 +13,7 @@ create table tushare_api_config (
   api_desc            text                                        comment '接口描述',
   api_params          text                                        comment '接口参数（JSON格式）',
   data_fields         text                                        comment '数据字段（JSON格式，用于指定需要下载的字段）',
+  primary_key_fields  text                                        comment '主键字段配置（JSON格式，为空则使用默认data_id主键）',
   status              char(1)         default '0'                 comment '状态（0正常 1停用）',
   create_by           varchar(64)     default ''                  comment '创建者',
   create_time         datetime                                     comment '创建时间',
@@ -167,3 +168,10 @@ alter table tushare_workflow_step add column source_step_ids text comment '前�
 alter table tushare_workflow_step add column target_step_ids text comment '后置步骤ID列表（JSON格式，支持多个后置节点）';
 alter table tushare_workflow_step add column layout_data json comment '完整的布局数据（JSON格式，存储节点位置、连接线等可视化信息）';
 alter table tushare_workflow_step add column data_table_name varchar(100) comment '数据存储表名（为空则使用任务配置的表名或默认表名）';
+
+-- ----------------------------
+-- 扩展流程步骤表，添加遍历模式和数据更新方式字段
+-- ----------------------------
+alter table tushare_workflow_step add column loop_mode char(1) default '0' comment '遍历模式（0否 1是，开启后所有变量参数都会遍历）';
+alter table tushare_workflow_step add column update_mode char(1) default '0' comment '数据更新方式（0仅插入 1忽略重复 2存在则更新 3先删除再插入）';
+alter table tushare_workflow_step add column unique_key_fields text comment '唯一键字段配置（JSON格式，为空则自动检测）';

@@ -115,6 +115,16 @@ async def edit_tushare_api_config(
     query_db: Annotated[AsyncSession, DBSessionDependency()],
     current_user: Annotated[CurrentUserModel, CurrentUserDependency()],
 ) -> Response:
+    # 记录接收到的数据，用于调试
+    logger.info(f'接收到的编辑接口配置数据 - config_id: {edit_api_config.config_id}, api_name: {edit_api_config.api_name}, api_code: {edit_api_config.api_code}')
+    logger.info(f'完整数据(by_alias=True): {edit_api_config.model_dump(by_alias=True)}')
+    logger.info(f'完整数据(by_alias=False): {edit_api_config.model_dump(by_alias=False)}')
+    
+    # 验证config_id是否存在
+    if not edit_api_config.config_id:
+        logger.error(f'config_id为空！接收到的数据: {edit_api_config.model_dump(by_alias=True)}')
+        return ResponseUtil.fail(msg='接口配置ID不能为空')
+    
     edit_api_config.update_by = current_user.user.user_name
     edit_api_config.update_time = datetime.now()
     edit_api_config_result = await TushareApiConfigService.edit_config_services(query_db, edit_api_config)
@@ -590,6 +600,28 @@ async def query_detail_tushare_workflow_config(
     query_db: Annotated[AsyncSession, DBSessionDependency()],
 ) -> Response:
     workflow_config_detail_result = await TushareWorkflowConfigService.workflow_detail_services(query_db, workflow_id)
+
+    return ResponseUtil.success(data=workflow_config_detail_result)
+
+
+@tushare_controller.get(
+    '/workflowConfig/base/{workflow_id}',
+    summary='获取Tushare流程配置基础信息接口',
+    description='用于获取指定Tushare流程配置的基础信息（不包含步骤列表），主要用于表单编辑回显',
+    response_model=DataResponseModel[TushareWorkflowConfigModel],
+    dependencies=[UserInterfaceAuthDependency('tushare:workflowConfig:query')],
+)
+async def query_base_tushare_workflow_config(
+    request: Request,
+    workflow_id: Annotated[int, Path(description='流程配置ID')],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    """
+    获取流程配置基础信息（不包含步骤），用于前端编辑表单回显
+    """
+    workflow_config_detail_result = await TushareWorkflowConfigService.workflow_base_detail_services(
+        query_db, workflow_id
+    )
 
     return ResponseUtil.success(data=workflow_config_detail_result)
 
