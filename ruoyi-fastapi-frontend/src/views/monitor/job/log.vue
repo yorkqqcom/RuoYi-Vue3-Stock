@@ -114,7 +114,7 @@
          </el-table-column>
          <el-table-column label="执行时间" align="center" prop="createTime" width="180">
             <template #default="scope">
-               <span>{{ parseTime(scope.row.createTime) }}</span>
+               <span>{{ parseTime(scope.row.createTime) || '-' }}</span>
             </template>
          </el-table-column>
          <el-table-column label="操作" align="center" class-name="small-padding fixed-width">
@@ -142,7 +142,7 @@
                </el-col>
                <el-col :span="12">
                   <el-form-item label="任务分组：">{{ jobGroupFormat(form) }}</el-form-item>
-                  <el-form-item label="执行时间：">{{ parseTime(form.createTime) }}</el-form-item>
+                  <el-form-item label="执行时间：">{{ parseTime(form.createTime) || '-' }}</el-form-item>
                </el-col>
                <el-col :span="24">
                   <el-form-item label="任务执行器：">{{ jobExecutorFormat(form) }}</el-form-item>

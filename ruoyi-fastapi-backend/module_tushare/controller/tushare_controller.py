@@ -3,6 +3,8 @@ from typing import Annotated
 
 from fastapi import Form, Path, Query, Request, Response
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
+from pydantic.alias_generators import to_camel
 from pydantic_validation_decorator import ValidateFields
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,6 +15,7 @@ from common.aspect.pre_auth import CurrentUserDependency, PreAuthDependency
 from common.enums import BusinessType
 from common.router import APIRouterPro
 from common.vo import DataResponseModel, PageResponseModel, ResponseBaseModel
+from module_tushare.entity.do.tushare_do import TushareData, TushareProBar
 from module_tushare.entity.vo.tushare_vo import (
     BatchSaveWorkflowStepModel,
     DeleteTushareApiConfigModel,
@@ -51,6 +54,374 @@ from utils.response_util import ResponseUtil
 tushare_controller = APIRouterPro(
     prefix='/tushare', order_num=20, tags=['Tushare数据管理'], dependencies=[PreAuthDependency()]
 )
+
+
+class StockSearchResultModel(BaseModel):
+    """
+    股票基础信息搜索结果模型（基于 stock_basic 数据）
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, from_attributes=True)
+
+    ts_code: str | None = Field(default=None, description='股票代码')
+    symbol: str | None = Field(default=None, description='股票简称代码')
+    name: str | None = Field(default=None, description='股票名称')
+    area: str | None = Field(default=None, description='所在地域')
+    industry: str | None = Field(default=None, description='所属行业')
+    list_date: str | None = Field(default=None, description='上市日期（YYYYMMDD）')
+
+
+@tushare_controller.get(
+    '/stock/search',
+    summary='按关键字搜索股票基础信息接口',
+    description='优先从物理表 tushare_stock_basic 中按代码/中文名/英文名模糊搜索股票，若无该表则回退到通用表 tushare_data 中的 stock_basic 数据',
+    response_model=DataResponseModel[list[StockSearchResultModel]],
+    dependencies=[UserInterfaceAuthDependency('tushare:apiConfig:list')],
+)
+async def search_stock_basic(
+    request: Request,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    keyword: Annotated[str, Query(description='代码/中文名/英文名关键字')],
+    limit: Annotated[int, Query(ge=1, le=50)] = 20,
+) -> Response:
+    """
+    优先从物理表 tushare_stock_basic 中查询，
+    若该表不存在或查询出错，则回退到通用表 tushare_data 中 api_code = 'stock_basic' 的最新数据。
+    """
+    from sqlalchemy import desc, select, text
+
+    kw = keyword.strip().lower()
+    if not kw:
+        return ResponseUtil.success(data=[])
+
+    results: list[StockSearchResultModel] = []
+
+    # 1. 优先尝试从物理表 tushare_stock_basic 查询
+    try:
+        # 简单检测表是否存在（不同数据库略有差异，这里使用 information_schema）
+        from config.env import DataBaseConfig
+
+        if DataBaseConfig.db_type == 'postgresql':
+            check_sql = """
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables
+                    WHERE table_schema = 'public'
+                      AND table_name = 'tushare_stock_basic'
+                )
+            """
+        else:
+            check_sql = """
+                SELECT COUNT(*) AS count
+                FROM information_schema.tables
+                WHERE table_schema = DATABASE()
+                  AND table_name = 'tushare_stock_basic'
+            """
+
+        check_result = await query_db.execute(text(check_sql))
+        table_exists = check_result.scalar()
+        if DataBaseConfig.db_type != 'postgresql':
+            table_exists = table_exists > 0
+
+        if table_exists:
+            # 直接从 tushare_stock_basic 表按代码/名称模糊查询
+            search_sql = """
+                SELECT ts_code, symbol, name, area, industry, list_date
+                FROM tushare_stock_basic
+                WHERE LOWER(CONCAT(COALESCE(ts_code, ''), ' ', COALESCE(symbol, ''), ' ', COALESCE(name, ''))) LIKE :kw
+                ORDER BY ts_code
+                LIMIT :limit
+            """
+            db_res = await query_db.execute(
+                text(search_sql),
+                {'kw': f'%{kw}%', 'limit': limit},
+            )
+            rows = db_res.fetchall()
+            for row in rows:
+                # row 可能是 Row 对象，按下标或键名访问
+                ts_code = str(row[0] or '')
+                symbol = str(row[1] or '')
+                name = str(row[2] or '')
+                results.append(
+                    StockSearchResultModel(
+                        ts_code=ts_code or None,
+                        symbol=symbol or None,
+                        name=name or None,
+                        area=row[3],
+                        industry=row[4],
+                        list_date=row[5],
+                    )
+                )
+
+            if results:
+                return ResponseUtil.success(data=results)
+    except Exception as e:
+        # 表不存在或查询失败时，记录日志并回退到通用表逻辑
+        logger.warning(f'从 tushare_stock_basic 查询股票失败，将回退到 tushare_data。错误: {e}')
+
+    # 2. 回退：从通用表 tushare_data 中获取最近的 stock_basic 数据
+    stmt = (
+        select(TushareData)
+        .where(TushareData.api_code == 'stock_basic')
+        .order_by(desc(TushareData.download_date), desc(TushareData.data_id))
+    ).limit(5000)
+
+    data_rows = (await query_db.execute(stmt)).scalars().all()
+
+    for row in data_rows:
+        data_content = row.data_content or {}
+
+        # 正常情况下，每条记录是一行数据的 dict
+        if isinstance(data_content, list):
+            candidates = data_content
+        else:
+            candidates = [data_content]
+
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+
+            ts_code = str(item.get('ts_code', '') or '')
+            symbol = str(item.get('symbol', '') or '')
+            name = str(item.get('name', '') or '')
+
+            text_val = f'{ts_code} {symbol} {name}'.lower()
+            if kw in text_val:
+                results.append(
+                    StockSearchResultModel(
+                        ts_code=ts_code or None,
+                        symbol=symbol or None,
+                        name=name or None,
+                        area=item.get('area'),
+                        industry=item.get('industry'),
+                        list_date=item.get('list_date'),
+                    )
+                )
+                if len(results) >= limit:
+                    return ResponseUtil.success(data=results)
+
+    return ResponseUtil.success(data=results)
+
+
+class StockDailyKlinePointModel(BaseModel):
+    """
+    股票日线K线点数据模型（基于 tushare_pro_bar 表）
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, from_attributes=True, populate_by_name=True)
+
+    ts_code: str | None = Field(default=None, description='股票代码')
+    trade_date: str | None = Field(default=None, description='交易日期（YYYYMMDD）')
+    open: float | None = Field(default=None, description='开盘价')
+    high: float | None = Field(default=None, description='最高价')
+    low: float | None = Field(default=None, description='最低价')
+    close: float | None = Field(default=None, description='收盘价')
+    pct_chg: float | None = Field(default=None, description='涨跌幅')
+
+
+@tushare_controller.get(
+    '/stock/daily',
+    summary='按股票和日期区间查询本地日线数据接口',
+    description='从本地 tushare_pro_bar 表中，按股票代码和日期范围查询日线K线数据（不直接调用外部Tushare接口）',
+    response_model=DataResponseModel[list[StockDailyKlinePointModel]],
+    dependencies=[PreAuthDependency()],
+)
+async def get_stock_daily_kline(
+    request: Request,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    ts_code: Annotated[str, Query(alias='tsCode', description='股票代码，例如：000001.SZ')],
+    start_date: Annotated[str | None, Query(alias='startDate', description='开始日期（YYYYMMDD）')] = None,
+    end_date: Annotated[str | None, Query(alias='endDate', description='结束日期（YYYYMMDD）')] = None,
+) -> Response:
+    """
+    使用本地 tushare_pro_bar 表中已下载的日线数据，
+    按 ts_code 和日期范围查询，并按 trade_date 正序返回。
+    """
+    from sqlalchemy import select, func
+
+    # 清理参数：去除前后空格，统一大小写
+    ts_code = ts_code.strip() if ts_code else ''
+    logger.info(f'查询日线数据：ts_code={repr(ts_code)}, start_date={start_date}, end_date={end_date}')
+
+    # 兼容两种写法：
+    # 1. 标准 Tushare 代码：如 000001.SZ -> 精确匹配
+    # 2. 只输入数字代码：如 000001、301428 -> 按前缀匹配（000001.%）
+    # 显式指定需要的字段，避免选择所有字段时可能出现的字段名问题
+    if '.' in ts_code:
+        # 精确匹配：去除空格后精确匹配
+        stmt = (
+            select(
+                TushareProBar.ts_code,
+                TushareProBar.trade_date,
+                TushareProBar.open,
+                TushareProBar.high,
+                TushareProBar.low,
+                TushareProBar.close,
+                TushareProBar.pct_chg,
+            )
+            .where(TushareProBar.ts_code == ts_code)
+        )
+    else:
+        # 前缀匹配：如 001300 -> 匹配 001300.SZ, 001300.SH 等
+        like_pattern = f'{ts_code}.%'
+        stmt = (
+            select(
+                TushareProBar.ts_code,
+                TushareProBar.trade_date,
+                TushareProBar.open,
+                TushareProBar.high,
+                TushareProBar.low,
+                TushareProBar.close,
+                TushareProBar.pct_chg,
+            )
+            .where(TushareProBar.ts_code.like(like_pattern))
+        )
+    if start_date:
+        stmt = stmt.where(TushareProBar.trade_date >= start_date)
+    if end_date:
+        stmt = stmt.where(TushareProBar.trade_date <= end_date)
+    stmt = stmt.order_by(TushareProBar.trade_date)
+
+    result_proxy = await query_db.execute(stmt)
+    # 使用 mappings() 得到字典形式行，键为列名，避免 Row 下标/属性取不到 ts_code/trade_date
+    rows = result_proxy.mappings().all()
+    logger.info(f'查询结果：找到 {len(rows)} 条记录，ts_code={repr(ts_code)}')
+
+    # ========== 详细调试：第一条 RowMapping 的完整信息 ==========
+    if rows:
+        first_row = rows[0]
+        logger.info(f'[调试] 第一条 RowMapping 类型: {type(first_row)}')
+        logger.info(f'[调试] 第一条 RowMapping 所有键: {list(first_row.keys())}')
+        logger.info(f'[调试] 第一条 RowMapping 所有键值对: {dict(first_row)}')
+        logger.info(f'[调试] 第一条 RowMapping values() 顺序: {list(first_row.values())}')
+        logger.info(f'[调试] 第一条 RowMapping 键值类型: {[(k, type(v).__name__, repr(v)[:50]) for k, v in first_row.items()]}')
+
+    if not rows and '.' in ts_code:
+        logger.warning(f'精确匹配未找到数据，尝试模糊匹配：ts_code={repr(ts_code)}')
+        code_prefix = ts_code.split('.')[0]
+        like_pattern = f'{code_prefix}.%'
+        stmt_fallback = (
+            select(
+                TushareProBar.ts_code,
+                TushareProBar.trade_date,
+                TushareProBar.open,
+                TushareProBar.high,
+                TushareProBar.low,
+                TushareProBar.close,
+                TushareProBar.pct_chg,
+            )
+            .where(TushareProBar.ts_code.like(like_pattern))
+        )
+        if start_date:
+            stmt_fallback = stmt_fallback.where(TushareProBar.trade_date >= start_date)
+        if end_date:
+            stmt_fallback = stmt_fallback.where(TushareProBar.trade_date <= end_date)
+        stmt_fallback = stmt_fallback.order_by(TushareProBar.trade_date)
+        result_fallback = await query_db.execute(stmt_fallback)
+        rows_fallback = result_fallback.mappings().all()
+        if rows_fallback:
+            logger.info(f'模糊匹配找到 {len(rows_fallback)} 条记录')
+            rows = rows_fallback
+
+    # RowMapping 的 values() 顺序可能是键名字母序，不是 select 顺序，故按键名匹配取值
+    def _to_str(v):
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return v
+        if hasattr(v, 'strftime'):  # date/datetime
+            return v.strftime('%Y%m%d')
+        return str(v)
+
+    def get_by_key(row, key_suffix: str, debug: bool = False):
+        """按键名匹配：key 等于 key_suffix 或以 _key_suffix 结尾（如 tushare_pro_bar_ts_code）"""
+        matched_key = None
+        matched_value = None
+        for k, v in row.items():
+            if k == key_suffix or (k.endswith('_' + key_suffix) and len(k) > len(key_suffix)):
+                matched_key = k
+                matched_value = v
+                if debug:
+                    logger.info(f'[调试] get_by_key("{key_suffix}") 匹配到键: {k}, 值: {repr(v)[:50]}, 类型: {type(v).__name__}')
+                return v
+        if debug:
+            logger.warning(f'[调试] get_by_key("{key_suffix}") 未找到匹配键，可用键: {list(row.keys())}')
+        return None
+
+    def row_to_model(row, is_first: bool = False):
+        # 第一条记录打印详细调试信息
+        ts_code = get_by_key(row, 'ts_code', debug=is_first)
+        trade_date = get_by_key(row, 'trade_date', debug=is_first)
+        open_ = get_by_key(row, 'open', debug=is_first)
+        high = get_by_key(row, 'high', debug=is_first)
+        low = get_by_key(row, 'low', debug=is_first)
+        close = get_by_key(row, 'close', debug=is_first)
+        pct_chg = get_by_key(row, 'pct_chg', debug=is_first)
+
+        if is_first:
+            logger.info(f'[调试] 第一条记录提取结果:')
+            logger.info(f'  ts_code: {repr(ts_code)} (类型: {type(ts_code).__name__})')
+            logger.info(f'  trade_date: {repr(trade_date)} (类型: {type(trade_date).__name__})')
+            logger.info(f'  open: {repr(open_)} (类型: {type(open_).__name__})')
+            logger.info(f'  high: {repr(high)} (类型: {type(high).__name__})')
+            logger.info(f'  low: {repr(low)} (类型: {type(low).__name__})')
+            logger.info(f'  close: {repr(close)} (类型: {type(close).__name__})')
+            logger.info(f'  pct_chg: {repr(pct_chg)} (类型: {type(pct_chg).__name__})')
+
+        # 转换字符串字段
+        ts_code_str = _to_str(ts_code)
+        trade_date_str = _to_str(trade_date)
+        
+        if is_first:
+            logger.info(f'[调试] _to_str 转换结果:')
+            logger.info(f'  ts_code: {repr(ts_code)} -> {repr(ts_code_str)}')
+            logger.info(f'  trade_date: {repr(trade_date)} -> {repr(trade_date_str)}')
+
+        # 创建模型实例：Pydantic v2 在 alias_generator=to_camel 时解析可能只认别名，用 camelCase 键传入
+        model_kwargs = {
+            'tsCode': ts_code_str,
+            'tradeDate': trade_date_str,
+            'open': open_,
+            'high': high,
+            'low': low,
+            'close': close,
+            'pctChg': pct_chg,
+        }
+        
+        if is_first:
+            logger.info(f'[调试] 创建 StockDailyKlinePointModel 的参数 (camelCase):')
+            logger.info(f'  {model_kwargs}')
+
+        try:
+            model_data = StockDailyKlinePointModel(**model_kwargs)
+            if is_first:
+                logger.info(f'[调试] 模型创建成功，原始字段值:')
+                logger.info(f'  model_data.ts_code = {repr(model_data.ts_code)}')
+                logger.info(f'  model_data.trade_date = {repr(model_data.trade_date)}')
+        except Exception as e:
+            logger.error(f'[调试] 模型创建失败: {e}', exc_info=True)
+            raise
+
+        dumped = model_data.model_dump(by_alias=True)
+
+        if is_first:
+            logger.info(f'[调试] 第一条记录序列化后 (model_dump by_alias=True):')
+            logger.info(f'  {dumped}')
+            logger.info(f'[调试] 序列化前模型字段: ts_code={repr(model_data.ts_code)}, trade_date={repr(model_data.trade_date)}')
+            logger.info(f'[调试] 序列化后字典: tsCode={repr(dumped.get("tsCode"))}, tradeDate={repr(dumped.get("tradeDate"))}')
+
+        return dumped
+
+    result = [row_to_model(row, is_first=(idx == 0)) for idx, row in enumerate(rows)]
+
+    if result:
+        logger.info(f'[调试] 最终返回结果统计: 共 {len(result)} 条')
+        logger.info(f'[调试] 第一条最终数据: tsCode={result[0].get("tsCode")}, tradeDate={result[0].get("tradeDate")}')
+        logger.info(f'[调试] 第一条完整数据: {result[0]}')
+        if len(result) > 1:
+            logger.info(f'[调试] 最后一条最终数据: tsCode={result[-1].get("tsCode")}, tradeDate={result[-1].get("tradeDate")}')
+
+    return ResponseUtil.success(data=result)
+
 
 # ==================== Tushare接口配置管理 ====================
 
@@ -123,7 +494,7 @@ async def edit_tushare_api_config(
     # 验证config_id是否存在
     if not edit_api_config.config_id:
         logger.error(f'config_id为空！接收到的数据: {edit_api_config.model_dump(by_alias=True)}')
-        return ResponseUtil.fail(msg='接口配置ID不能为空')
+        return ResponseUtil.failure(msg='接口配置ID不能为空')
     
     edit_api_config.update_by = current_user.user.user_name
     edit_api_config.update_time = datetime.now()

@@ -17,6 +17,7 @@ from module_tushare.dao.tushare_dao import (
     TushareApiConfigDao,
     TushareDataDao,
     TushareDownloadLogDao,
+    TushareDownloadRunDao,
     TushareDownloadTaskDao,
     TushareWorkflowConfigDao,
     TushareWorkflowStepDao,
@@ -371,6 +372,17 @@ async def execute_single_api(session: AsyncSession, task, download_date: str) ->
     # 注意：不再自动添加日期参数，所有参数必须从配置中获取
     # 如果需要在参数中使用日期，请在接口配置或步骤参数中明确指定
 
+    # 创建运行记录（PENDING -> RUNNING）
+    # 注意：这里立即缓存 run_id，后续不再访问 ORM 对象属性，避免在 commit 之后触发延迟加载
+    run_record = await TushareDownloadRunDao.create_run_record(session, task, initial_status='PENDING')
+    run_id = run_record.run_id
+    await TushareDownloadRunDao.update_run_status(
+        session,
+        run_id,
+        status='RUNNING',
+        set_start_time=True,
+    )
+
     # 调用tushare接口
     logger.info(f'开始下载任务: {task_name}, 接口: {config_api_code}, 参数: {api_params}')
 
@@ -399,7 +411,26 @@ async def execute_single_api(session: AsyncSession, task, download_date: str) ->
     except Exception as api_error:
         error_detail = f'Tushare接口调用失败: {str(api_error)}\n参数: {api_params}'
         logger.exception(f'任务 {task_name} Tushare接口调用异常: {error_detail}')
-        raise Exception(error_detail) from api_error
+        # 更新运行记录为 FAILED
+        await TushareDownloadRunDao.update_run_status(
+            session,
+            run_record.run_id,
+            status='FAILED',
+            error_message=error_detail,
+            set_end_time=True,
+        )
+        # 更新任务统计
+        await TushareDownloadTaskDao.edit_task_dao(
+            session,
+            task_task_id,
+            {
+                'run_count': task_run_count + 1,
+                'fail_count': (task.fail_count or 0) + 1,
+                'last_run_time': datetime.now(),
+            },
+        )
+        await session.commit()
+        return
 
     if df is None or df.empty:
         logger.warning(f'任务 {task_name} 下载数据为空')
@@ -423,23 +454,42 @@ async def execute_single_api(session: AsyncSession, task, download_date: str) ->
                 table_name = task_data_table_name if task_data_table_name and task_data_table_name.strip() else None
                 if not table_name:
                     table_name = f'tushare_{config_api_code}'
-                
+
                 await ensure_table_exists(session, table_name, config_api_code, df, config)
-                
+
                 # 获取唯一键字段（优先级：如果表已存在且接口配置的主键字段也有，则优先使用接口配置 > 表实际主键 > 接口配置 > 自动检测）
                 unique_key_fields = await TushareDataDao.get_unique_key_fields(
                     session, table_name, config=config, step_unique_key_fields=None
                 )
-                
-                await TushareDataDao.add_dataframe_to_table_dao(
+
+                inserted_count = await TushareDataDao.add_dataframe_to_table_dao(
                     session, table_name, df, task_task_id, config_config_id, config_api_code, download_date,
                     update_mode='0', unique_key_fields=unique_key_fields, config=config
                 )
-                logger.info(f'已保存 {len(df)} 条数据到数据库表 {table_name}')
+                logger.info(f'已保存 {inserted_count} 条数据到数据库表 {table_name}')
             except Exception as db_error:
                 error_detail = f'保存数据到数据库失败: {str(db_error)}'
                 logger.exception(f'任务 {task_name} 保存数据到数据库异常: {error_detail}')
-                raise Exception(error_detail) from db_error
+                # 更新运行记录为 FAILED
+                await TushareDownloadRunDao.update_run_status(
+                    session,
+                    run_record.run_id,
+                    status='FAILED',
+                    error_message=error_detail,
+                    set_end_time=True,
+                )
+                # 更新任务统计
+                await TushareDownloadTaskDao.edit_task_dao(
+                    session,
+                    task_task_id,
+                    {
+                        'run_count': task_run_count + 1,
+                        'fail_count': (task.fail_count or 0) + 1,
+                        'last_run_time': datetime.now(),
+                    },
+                )
+                await session.commit()
+                return
 
         # 保存到文件（如果配置了保存路径）
         file_path = None
@@ -488,7 +538,17 @@ async def execute_single_api(session: AsyncSession, task, download_date: str) ->
     )
 
     await TushareDownloadLogDao.add_log_dao(session, log)
-    
+
+    # 更新运行记录为 SUCCESS
+    await TushareDownloadRunDao.update_run_status(
+        session,
+        run_record.run_id,
+        status='SUCCESS',
+        total_records=record_count,
+        success_records=record_count,
+        set_end_time=True,
+    )
+
     # 更新任务统计（使用字典方式，避免被排除列表影响）
     update_stats_dict = {
         'run_count': task_run_count + 1,
@@ -496,7 +556,7 @@ async def execute_single_api(session: AsyncSession, task, download_date: str) ->
         'last_run_time': datetime.now()
     }
     await TushareDownloadTaskDao.edit_task_dao(session, task_task_id, update_stats_dict)
-    
+
     await session.commit()
     logger.info(f'任务 {task_name} 执行成功，记录数: {record_count}, 耗时: {duration}秒')
 
@@ -1270,7 +1330,8 @@ async def execute_workflow(session: AsyncSession, task, download_date: str, task
     :return: None
     """
     start_time = datetime.now()
-    
+    workflow_failed = False
+    last_error_message: str | None = None
     # 提前提取 task 对象的所有属性，避免在 commit 后访问 ORM 对象导致延迟加载问题
     # 这是关键优化：一次性加载所有属性，后续不再访问 task 对象
     try:
@@ -1301,6 +1362,17 @@ async def execute_workflow(session: AsyncSession, task, download_date: str, task
     if workflow.status != '0':
         logger.warning(f'流程配置 {workflow.workflow_name} 已停用')
         return
+
+    # 创建运行记录（PENDING -> RUNNING）
+    # 注意：这里立即缓存 run_id，后续不再访问 ORM 对象属性，避免在 commit 之后触发延迟加载
+    run_record = await TushareDownloadRunDao.create_run_record(session, task, initial_status='PENDING')
+    run_id = run_record.run_id
+    await TushareDownloadRunDao.update_run_status(
+        session,
+        run_id,
+        status='RUNNING',
+        set_start_time=True,
+    )
 
     # 获取流程步骤（按顺序）
     steps = await TushareWorkflowStepDao.get_steps_by_workflow_id(session, task_workflow_id)
@@ -1572,6 +1644,8 @@ async def execute_workflow(session: AsyncSession, task, download_date: str, task
                     
                     # 异常处理：使用提前提取的 step_name，不访问 step 对象
                     logger.error(f'步骤 {step_name} 组合{combo_index} 执行失败: {step_error}')
+                    workflow_failed = True
+                    last_error_message = str(step_error)
                     record_count = 0
                     df = None
                 
@@ -1831,6 +1905,11 @@ async def execute_workflow(session: AsyncSession, task, download_date: str, task
                 previous_step_name = step_name
                 
                 total_record_count += record_count
+            else:
+                # 单步执行失败（df 为 None 且没有数据）
+                if df is None:
+                    workflow_failed = True
+                    last_error_message = f'步骤 {step_name} 执行失败或未返回数据'
             
             # 步骤执行完成后立即 commit，然后再执行下一个步骤
             # 注意：commit 失败时不抛出异常，只记录错误并继续执行
@@ -1848,21 +1927,42 @@ async def execute_workflow(session: AsyncSession, task, download_date: str, task
     # 计算总执行时长
     duration = int((datetime.now() - start_time).total_seconds())
 
-    # 更新任务统计（使用字典方式，避免被排除列表影响）
-    # 使用提前提取的 task_task_id，避免在 commit 后访问 ORM 对象导致延迟加载
-    # 注意：这里需要重新查询 task 对象以获取最新的统计信息，或者使用提前提取的值
-    # 为了安全，我们重新查询一次（在 commit 之前）
+    # 更新运行记录和任务统计
+    # 重新获取任务以保证统计字段最新
     current_task = await TushareDownloadTaskDao.get_task_detail_by_id(session, task_task_id)
+    run_update_status = 'FAILED' if workflow_failed else 'SUCCESS'
+
+    await TushareDownloadRunDao.update_run_status(
+        session,
+        run_id,
+        status=run_update_status,
+        total_records=total_record_count,
+        success_records=total_record_count if not workflow_failed else 0,
+        fail_records=0 if not workflow_failed else 1,
+        error_message=last_error_message,
+        set_end_time=True,
+    )
+
     if current_task:
-        update_stats_dict = {
-            'run_count': (current_task.run_count or 0) + 1,
-            'success_count': (current_task.success_count or 0) + 1,
-            'last_run_time': datetime.now()
-        }
+        if workflow_failed:
+            update_stats_dict = {
+                'run_count': (current_task.run_count or 0) + 1,
+                'fail_count': (current_task.fail_count or 0) + 1,
+                'last_run_time': datetime.now(),
+            }
+        else:
+            update_stats_dict = {
+                'run_count': (current_task.run_count or 0) + 1,
+                'success_count': (current_task.success_count or 0) + 1,
+                'last_run_time': datetime.now(),
+            }
         await TushareDownloadTaskDao.edit_task_dao(session, task_task_id, update_stats_dict)
-    
+
     await session.commit()
-    logger.info(f'流程任务 {task_name} 执行完成，总记录数: {total_record_count}, 总耗时: {duration}秒')
+    logger.info(
+        f'流程任务 {task_name} 执行{"失败" if workflow_failed else "完成"}，'
+        f'总记录数: {total_record_count}, 总耗时: {duration}秒'
+    )
 
 
 async def download_tushare_data(task_id: int, download_date: str | None = None, session: AsyncSession | None = None) -> None:

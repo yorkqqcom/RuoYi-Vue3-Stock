@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import CHAR, BigInteger, Column, DateTime, Integer, String, Text
+from sqlalchemy import CHAR, BigInteger, Column, DateTime, Float, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.types import JSON
 
@@ -87,6 +87,29 @@ class TushareDownloadLog(Base):
     create_time = Column(DateTime, nullable=True, default=datetime.now(), comment='创建时间')
 
 
+class TushareDownloadRun(Base):
+    """
+    Tushare下载任务运行表（运行总览）
+    """
+
+    __tablename__ = 'tushare_download_run'
+    __table_args__ = {'comment': 'Tushare下载任务运行表（运行总览）'}
+
+    run_id = Column(BigInteger, primary_key=True, nullable=False, autoincrement=True, comment='运行ID')
+    task_id = Column(BigInteger, nullable=False, comment='任务ID')
+    task_name = Column(String(100), nullable=False, comment='任务名称快照')
+    status = Column(String(20), nullable=False, comment='运行状态（PENDING/RUNNING/SUCCESS/FAILED/CANCELED/TIMEOUT）')
+    start_time = Column(DateTime, nullable=True, comment='开始时间')
+    end_time = Column(DateTime, nullable=True, comment='结束时间')
+    progress = Column(Integer, nullable=True, default=0, comment='进度（0-100）')
+    total_records = Column(Integer, nullable=True, default=0, comment='本次处理总记录数')
+    success_records = Column(Integer, nullable=True, default=0, comment='成功记录数')
+    fail_records = Column(Integer, nullable=True, default=0, comment='失败记录数')
+    error_message = Column(Text, nullable=True, comment='错误信息')
+    create_time = Column(DateTime, nullable=True, default=datetime.now(), comment='创建时间')
+    update_time = Column(DateTime, nullable=True, default=datetime.now(), comment='更新时间')
+
+
 class TushareData(Base):
     """
     Tushare数据存储表（通用表）
@@ -163,3 +186,30 @@ class TushareWorkflowStep(Base):
     update_by = Column(String(64), nullable=True, server_default="''", comment='更新者')
     update_time = Column(DateTime, nullable=True, default=datetime.now(), comment='更新时间')
     remark = Column(String(500), nullable=True, server_default="''", comment='备注信息')
+
+
+class TushareProBar(Base):
+    """
+    Tushare Pro Bar数据表
+    """
+
+    __tablename__ = 'tushare_pro_bar'
+    __table_args__ = {'comment': 'Tushare Pro Bar数据表'}
+
+    data_id = Column(BigInteger, primary_key=True, nullable=False, autoincrement=True, comment='数据ID')
+    task_id = Column(BigInteger, nullable=False, comment='任务ID')
+    config_id = Column(BigInteger, nullable=False, comment='配置ID')
+    api_code = Column(String(100), nullable=False, comment='接口代码')
+    download_date = Column(String(20), nullable=True, comment='下载日期（YYYYMMDD）')
+    create_time = Column(DateTime, nullable=True, default=datetime.now(), comment='创建时间')
+    ts_code = Column(String(500), nullable=True, comment='股票代码')
+    trade_date = Column(String(500), nullable=True, comment='交易日期')
+    open = Column(Float, nullable=True, comment='开盘价')
+    high = Column(Float, nullable=True, comment='最高价')
+    low = Column(Float, nullable=True, comment='最低价')
+    close = Column(Float, nullable=True, comment='收盘价')
+    pre_close = Column(Float, nullable=True, comment='昨收价')
+    change = Column(Float, nullable=True, comment='涨跌额')
+    pct_chg = Column(Float, nullable=True, comment='涨跌幅')
+    vol = Column(Float, nullable=True, comment='成交量')
+    amount = Column(Float, nullable=True, comment='成交额')

@@ -25,6 +25,10 @@ export function parseTime(time, pattern) {
     }
     date = new Date(time)
   }
+  // 无效日期（如 Invalid Date）不格式化，避免显示 0-0-0 0:0:0
+  if (isNaN(date.getTime())) {
+    return null
+  }
   const formatObj = {
     y: date.getFullYear(),
     m: date.getMonth() + 1,

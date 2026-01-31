@@ -1,5 +1,6 @@
 from collections.abc import Sequence
 from typing import Any
+from datetime import datetime
 
 import pandas as pd
 from sqlalchemy import delete, select, update
@@ -10,6 +11,7 @@ from module_tushare.entity.do.tushare_do import (
     TushareApiConfig,
     TushareData,
     TushareDownloadLog,
+    TushareDownloadRun,
     TushareDownloadTask,
     TushareWorkflowConfig,
     TushareWorkflowStep,
@@ -497,6 +499,80 @@ class TushareDownloadLogDao:
         """
         result = await db.execute(delete(TushareDownloadLog))
         return result.rowcount
+
+
+class TushareDownloadRunDao:
+    """
+    Tushare下载任务运行表（运行总览）数据库操作层
+    """
+
+    @classmethod
+    async def create_run_record(
+        cls,
+        db: AsyncSession,
+        task: TushareDownloadTask,
+        initial_status: str = 'PENDING',
+    ) -> TushareDownloadRun:
+        """
+        创建一条运行记录（初始为 PENDING 或 RUNNING）
+        """
+        run = TushareDownloadRun(
+            task_id=task.task_id,
+            task_name=task.task_name,
+            status=initial_status,
+            start_time=None,
+            end_time=None,
+            progress=0,
+            total_records=0,
+            success_records=0,
+            fail_records=0,
+        )
+        db.add(run)
+        await db.flush()
+        await db.refresh(run)
+        return run
+
+    @classmethod
+    async def update_run_status(
+        cls,
+        db: AsyncSession,
+        run_id: int,
+        status: str | None = None,
+        progress: int | None = None,
+        total_records: int | None = None,
+        success_records: int | None = None,
+        fail_records: int | None = None,
+        error_message: str | None = None,
+        set_start_time: bool = False,
+        set_end_time: bool = False,
+    ) -> int:
+        """
+        更新运行记录的状态/进度/统计信息
+        """
+        values: dict[str, Any] = {}
+        if status is not None:
+            values['status'] = status
+        if progress is not None:
+            values['progress'] = progress
+        if total_records is not None:
+            values['total_records'] = total_records
+        if success_records is not None:
+            values['success_records'] = success_records
+        if fail_records is not None:
+            values['fail_records'] = fail_records
+        if error_message is not None:
+            values['error_message'] = error_message
+        now = datetime.now()
+        if set_start_time:
+            values['start_time'] = now
+        if set_end_time:
+            values['end_time'] = now
+        if values:
+            values['update_time'] = now
+            await db.execute(
+                update(TushareDownloadRun).where(TushareDownloadRun.run_id == run_id).values(**values)
+            )
+        return run_id
 
 
 class TushareDataDao:

@@ -96,6 +96,11 @@ class Log:
                 result = ResponseUtil.error(data=e.data, msg=e.message)
             except Exception as e:
                 logger.exception(e)
+                # 若业务中发生异常，session 可能已被标记为 rolled back，先 rollback 以便后续写操作日志时能正常 flush
+                try:
+                    await query_db.rollback()
+                except Exception:
+                    pass
                 result = ResponseUtil.error(msg=str(e))
             # 获取请求耗时
             cost_time = float(time.perf_counter() - start_time) * 1000
@@ -212,11 +217,23 @@ class Log:
         # 请求体处理
         content_type = request.headers.get('Content-Type', '')
 
-        # JSON请求
+        # JSON 请求：先读原始 body 再解析，避免流被消费后控制器拿不到；同时缓存供接口使用
         if 'application/json' in content_type:
-            json_body = await request.json()
-            if json_body:
+            try:
+                body_bytes = await request.body()
+            except Exception:
+                body_bytes = b''
+            try:
+                json_body = json.loads(body_bytes) if body_bytes else None
+            except Exception:
+                json_body = None
+            if json_body is not None:
                 params['json_body'] = json_body
+            try:
+                request.state._cached_body_bytes = body_bytes
+                request.state._cached_json_body = json_body if json_body is not None else {}
+            except Exception:
+                pass
 
         # 表单数据
         elif 'multipart/form-data' in content_type or 'application/x-www-form-urlencoded' in content_type:

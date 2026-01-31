@@ -109,7 +109,7 @@
          </el-table-column>
          <el-table-column label="执行时间" align="center" prop="createTime" width="180">
             <template #default="scope">
-               <span>{{ parseTime(scope.row.createTime) }}</span>
+               <span>{{ parseTime(scope.row.createTime) || '-' }}</span>
             </template>
          </el-table-column>
          <el-table-column label="操作" align="center" width="100" class-name="small-padding fixed-width">
@@ -145,7 +145,7 @@
                   <el-form-item label="步骤名称：" v-if="form.stepName">
                      <el-tag type="primary" size="small">{{ form.stepName }}</el-tag>
                   </el-form-item>
-                  <el-form-item label="执行时间：">{{ parseTime(form.createTime) }}</el-form-item>
+                  <el-form-item label="执行时间：">{{ parseTime(form.createTime) || '-' }}</el-form-item>
                </el-col>
                <el-col :span="12">
                   <el-form-item label="下载日期：">{{ form.downloadDate }}</el-form-item>
